@@ -1,0 +1,16 @@
+{
+  "name": "workbuddy-action-reminder",
+  "version": "1.0.0",
+  "description": "长任务进入「等待用户确认 / 选择选项」状态时，触发 macOS 系统级置顶提醒并定期重复，直到用户处理或主动忽略；点击通知可聚焦 WorkBuddy。",
+  "author": {
+    "name": "闵金波 / 晓葆科技"
+  },
+  "keywords": [
+    "notification",
+    "reminder",
+    "hook",
+    "productivity",
+    "human-in-the-loop"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

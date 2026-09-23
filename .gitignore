@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Runtime state (managed by the daemon at ~/.workbuddy/action-reminder)
+state.json
+config.json
+daemon.log
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
