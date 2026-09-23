@@ -221,3 +221,11 @@ rm -rf ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder
 ## 11. 许可证
 
 MIT © 闵金波 / 晓葆科技
+
+---
+
+## 12. 开源仓库
+
+已发布至 GitHub：<https://github.com/KimberMIN/workbuddy-action-reminder>（main 分支）。
+
+发布环境对 GitHub 直连不稳定，实际通过 `gh-proxy.com` 镜像中转完成 push——`api.github.com` 经沙箱代理创建仓库，git 推送经 gh-proxy 转发 `Authorization` 头鉴权。
