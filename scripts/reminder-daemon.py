@@ -41,6 +41,7 @@ STATE_DIR = os.path.expanduser("~/.workbuddy/action-reminder")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 LOG_FILE = os.path.join(STATE_DIR, "daemon.log")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DQ = chr(34)  # 双引号 "
 
 # 重复提醒间隔（秒）。第 1 次立即弹出，之后按此序列追加。
@@ -82,7 +83,6 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
-    print(line, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,12 @@ def load_config():
         "enabled": True,
         "max_repeats": MAX_REPEATS,
         "total_timeout": TOTAL_TIMEOUT,
+        "feishu": {
+            "enabled": True,        # 是否经飞书发送提醒（跨设备可达）
+            "target_type": "user",  # user=私聊(open_id) / chat=群(chat_id)
+            "target_id": "",        # 飞书 open_id 或 chat_id；为空则跳过
+            "as": "bot",            # bot / user
+        },
     }
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -217,6 +223,30 @@ def notify(title, subtitle, body, group, sound=True):
         return False
 
 
+def notify_feishu(title, body):
+    """经飞书（lark-cli）发送提醒，跨设备可达（手机/桌面都能收到）。"""
+    fcfg = config.get("feishu", {})
+    if not fcfg.get("enabled", False):
+        return
+    if not fcfg.get("target_id"):
+        return
+    script = os.path.join(SCRIPT_DIR, "notify-feishu.sh")
+    if not os.path.exists(script):
+        return
+    try:
+        res = subprocess.run(["/bin/bash", script, title or "", body or ""],
+                             capture_output=True, timeout=15)
+        out = res.stdout.decode("utf-8", "ignore").strip()
+        if out:
+            log("feishu notify: %s" % out)
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", "ignore").strip()
+            if err:
+                log("feishu notify stderr: %s" % err[:200])
+    except Exception as e:
+        log("feishu notify failed: %s" % e)
+
+
 # ---------------------------------------------------------------------------
 # 待处理记录管理
 # ---------------------------------------------------------------------------
@@ -250,8 +280,10 @@ def create_pending(payload):
         }
         pending[key] = rec
         save_state()
+        # 首次提醒（含飞书通道）必须在此处与调度状态原子更新：
+        # 避免调度线程在 next_reminder_at 仍为「立即」时抢占并重复发送。
+        send_reminder(key, rec, first=True)
     log("CREATE pending %s type=%s session=%s" % (key, etype, rec.get("session_id")))
-    send_reminder(key, rec, first=True)
     return key, rec, True
 
 
@@ -305,6 +337,8 @@ def send_reminder(key, rec, first=False):
         body_parts.append("（第 %d 次提醒，点击聚焦 WorkBuddy）" % count)
     body = " | ".join(body_parts)
     notify(title, subtitle, body, group="wb-ar-" + key, sound=not in_quiet_hours())
+    # 飞书通道：跨设备可达（离开 Mac 也能在手机/桌面收到）
+    notify_feishu(title, body)
     rec["reminder_count"] = count + 1
     cfg_repeats = config.get("max_repeats", MAX_REPEATS)
     if rec["reminder_count"] <= cfg_repeats:

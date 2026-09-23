@@ -1,6 +1,6 @@
 # WorkBuddy Action Reminder
 
-> 当 WorkBuddy / CodeBuddy 长任务进入「等待用户确认 / 选择选项」状态时，触发 **macOS 系统级置顶提醒**并定期重复，直到用户处理或会话结束；点击通知可聚焦 WorkBuddy。
+> 当 WorkBuddy / CodeBuddy 长任务进入「等待用户确认 / 选择选项」状态时，触发 **macOS 系统级置顶提醒**并定期重复，同时经 **飞书** 跨设备送达（手机 / 桌面客户端），直到用户处理或会话结束；点击 macOS 通知可聚焦 WorkBuddy，飞书消息让你离开电脑也不漏接。
 
 作者：Kimber Min
 
@@ -42,15 +42,20 @@
 │   - 调度重复提醒          │
 │   - 2h 超时 / 静默时段    │
 │   - 接收 resolve 事件清除 │
+│   - 双通道通知（mac/飞书）│
 └───────────┬─────────────┘
             │ 调用
-            ▼
-┌─────────────────────────┐
-│   notify-macos.sh        │  terminal-notifier（优先）→ osascript（兜底）
-└───────────┬─────────────┘
-            │ 系统通知
-            ▼
-       macOS 通知中心（置顶 / 重复）
+       ┌────┴─────┐
+       ▼          ▼
+┌─────────────────┐   ┌─────────────────────────┐
+│ notify-macos.sh │   │ notify-feishu.sh         │
+│ terminal-notifier│   │ lark-cli（飞书 CLI）      │
+│ → osascript 兜底 │   │ 私聊(open_id)/群(chat_id)│
+└────────┬────────┘   └────────────┬────────────┘
+         │ 系统通知                 │ 飞书消息
+         ▼                          ▼
+   macOS 通知中心            飞书（手机 / 桌面客户端）
+   （置顶 / 重复）           —— 离开 Mac 也能收到
 ```
 
 **为什么是「Hook 转发 + 守护进程」两步？**
@@ -89,6 +94,7 @@ workbuddy-action-reminder/
 │   ├── reminder-daemon.py     # 核心：常驻 HTTP 守护进程（纯 stdlib，无依赖）
 │   ├── hook-dispatch.sh       # Hook 入口：解析并转发事件到守护进程
 │   ├── notify-macos.sh        # macOS 通知封装（terminal-notifier / osascript）
+│   ├── notify-feishu.sh       # 飞书通知封装（lark-cli，跨设备可达）
 │   └── action-reminderctl.sh  # 控制脚本：start/stop/status/test/install-launchd…
 ├── README.md
 └── LICENSE
@@ -168,17 +174,29 @@ cd ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder/1.0.0/scripts
 
 ```json
 {
-  "reminder_intervals": [180, 600, 900, 900],
-  "max_wait_seconds": 7200,
-  "quiet_hours": {"start": "23:00", "end": "08:00"},
-  "app_bundle": "com.tencent.workbuddy.mac"
+  "port": 18789,
+  "sound": "Ping",
+  "quiet_start": 23,
+  "quiet_end": 8,
+  "enabled": true,
+  "max_repeats": 4,
+  "total_timeout": 7200,
+  "feishu": {
+    "enabled": true,
+    "target_type": "user",
+    "target_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "as": "bot"
+  }
 }
 ```
 
-- `reminder_intervals`：每次提醒的间隔（秒），数组用尽后沿用最后一个值。
-- `max_wait_seconds`：单条交互最长等待时间，超时后停止提醒（避免无限骚扰）。
-- `quiet_hours`：静默时段，期间不打扰，但仍记录待处理状态。
-- `app_bundle`：点击通知时尝试聚焦的 App Bundle ID（需 terminal-notifier 才生效）。
+- `port`：守护进程监听端口（默认 `18789`，仅 127.0.0.1）。
+- `sound`：macOS 通知提示音名称（设为空字符串 `""` 可关闭声音）。
+- `quiet_start` / `quiet_end`：静默时段起止小时（24 制，支持跨午夜，如 `23`→`8`）；期间不打扰，但仍记录待处理状态。设为 `null` 表示不静默。
+- `enabled`：总开关，设为 `false` 时守护进程直接退出。
+- `max_repeats`：重复提醒次数上限；用尽后状态置为 `ESCALATED`，保留待处理记录但不再弹窗。
+- `total_timeout`：单条交互最长等待秒数（默认 7200 = 2h），超时后状态置为 `EXPIRED` 并停止提醒。
+- `feishu`：飞书跨设备通知通道配置，详见第 11 节。
 
 ---
 
@@ -218,9 +236,64 @@ rm -rf ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder
 
 ---
 
-## 11. 许可证
+## 11. 飞书跨设备通知
 
-MIT © KimberMIN
+macOS 通知要求人坐在电脑前；**飞书通道**让提醒经「飞书私聊 / 群」送达你的手机与桌面客户端，离开 Mac 也能第一时间收到「WorkBuddy 在等你确认」的提醒。
+
+### 11.1 前置条件
+
+- 已安装并登录飞书客户端；`lark-cli`（WorkBuddy 飞书连接器）可用且身份有效。
+- `lark-cli` 路径：优先取 `PATH` 中的 `lark-cli`，否则回退到
+  `~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli`（兼容 launchd 等窄 `PATH` 环境）。
+
+### 11.2 配置
+
+在 `~/.workbuddy/action-reminder/config.json` 的 `feishu` 块中设置：
+
+```json
+{
+  "feishu": {
+    "enabled": true,
+    "target_type": "user",
+    "target_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "as": "bot"
+  }
+}
+```
+
+- `enabled`：`true` 开启飞书通知；`false` 仅用 macOS 通知。
+- `target_type`：`user` = 发给指定用户私聊（用 `open_id`）；`chat` = 发到群（用 `chat_id`）。
+- `target_id`：飞书 `open_id`（私聊）或 `chat_id`（群）。**为空则跳过飞书通道**，不会报错。
+- `as`：发送身份，`bot`（机器人身份，无需用户在线）或 `user`（以你的身份发送）。
+
+> 获取你的 `open_id`：在飞书对话里 `@机器人` 或用 `lark-cli` 查询；也可从 WorkBuddy 飞书连接器的用户档案中取得。
+
+### 11.3 工作原理
+
+`reminder-daemon.py` 在每次 `send_reminder()` 中先弹 macOS 通知，再调用 `notify_feishu(title, body)`。后者执行同目录的 `notify-feishu.sh`，由脚本解析 `config.json` 的 `feishu` 配置并通过 `lark-cli im +messages-send` 发出。飞书发送失败只记日志、不阻断主流程（macOS 通知照常）。
+
+### 11.4 验证
+
+```bash
+# 触发一条测试提醒（会同时弹 macOS 通知 + 发飞书消息）
+cd ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder/1.0.0/scripts
+./action-reminderctl.sh test
+# 或
+curl -s --noproxy 127.0.0.1 -X POST http://127.0.0.1:18789/test
+```
+
+查看是否发送成功：
+
+```bash
+grep "feishu notify" ~/.workbuddy/action-reminder/daemon.log
+# 正常会看到：feishu notify: feishu ok= True msg_id= om_xxxxxxxx
+```
+
+### 11.5 限制与注意
+
+- 飞书消息为**文本内容**（标题 + 正文），不含点击深链；点击通知聚焦 WorkBuddy 仍是 macOS 通知的能力。
+- `config.json` 含个人 `open_id`，已被仓库 `.gitignore` 忽略，**不会随仓库提交**，可放心分享仓库。
+- `notify-feishu.sh` 不使用 `set -u`：macOS 自带 `/bin/bash` 为 3.2 版，`set -u` 与 `${1:-默认值}` 组合存在已知 bug（赋值成功但后续引用报 `unbound variable`），脚本改用显式兜底守卫保证兼容。
 
 ---
 
@@ -229,3 +302,9 @@ MIT © KimberMIN
 已发布至 GitHub：<https://github.com/KimberMIN/workbuddy-action-reminder>（main 分支）。
 
 发布环境对 GitHub 直连不稳定，实际通过 `gh-proxy.com` 镜像中转完成 push——`api.github.com` 经沙箱代理创建仓库，git 推送经 gh-proxy 转发 `Authorization` 头鉴权。
+
+---
+
+## 13. 许可证
+
+MIT © KimberMIN
