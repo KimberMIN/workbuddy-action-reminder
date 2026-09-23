@@ -220,7 +220,7 @@ rm -rf ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder
 
 ## 11. 许可证
 
-MIT © 闵金波 / 晓葆科技
+MIT © KimberMIN
 
 ---
 
