@@ -1,50 +1,76 @@
 #!/usr/bin/env bash
 # WorkBuddy Action Reminder — 飞书通知通道
-# 由 reminder-daemon.py 调用，参数: $1=title  $2=body
-# 经 lark-cli 发送飞书私聊/群消息（默认 bot 身份），实现跨设备（手机/桌面）提醒。
-# 注意：macOS 自带 /bin/bash 为 3.2 版本，set -u 与 ${1:-默认值} 组合存在已知 bug
-#（赋值成功但后续引用报 unbound variable），故此处不启用 set -u，改用显式兜底守卫。
-
+# 中文标点前使用 ${TITLE} 明确变量边界，避免被当成变量名的一部分。
+set -u
 CONFIG="${ACTION_REMINDER_CONFIG:-$HOME/.workbuddy/action-reminder/config.json}"
 TITLE="${1:-WorkBuddy 待操作提醒}"
 BODY="${2:-}"
-
-# 解析 lark-cli 路径：优先 PATH，其次 WorkBuddy 内置位置（兼容 launchd 等窄 PATH 环境）
-LARK="$(command -v lark-cli 2>/dev/null)"
-if [ -z "$LARK" ] && [ -x "$HOME/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli" ]; then
-  LARK="$HOME/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli"
+PYTHON="${ACTION_REMINDER_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  if [ -x /usr/bin/python3 ]; then
+    PYTHON=/usr/bin/python3
+  else
+    PYTHON="$(command -v python3 2>/dev/null)"
+  fi
 fi
-[ -z "$LARK" ] && { echo "lark-cli not found"; exit 0; }
+[ -n "$PYTHON" ] || { printf '%s\n' 'feishu failed: Python 不可用' >&2; exit 1; }
+TEXT="【${TITLE}】
+${BODY}"
+exec "$PYTHON" - "$CONFIG" "$TEXT" <<'PY'
+import json
+import os
+import shutil
+import subprocess
+import sys
 
-# 从 config 读取飞书目标（target_type / target_id / as）
-PARSED="$(python3 -c '
-import json,sys
+
+def fail(reason, code=1):
+    # 不回显 CLI 原始输出、命令参数或配置，防止凭据进入日志。
+    print('feishu failed: ' + reason, file=sys.stderr)
+    sys.exit(code)
+
+
 try:
-    c=json.load(open(sys.argv[1]))
-except Exception:
-    c={}
-f=c.get("feishu",{})
-print(f.get("target_type","user"))
-print(f.get("target_id","") or "")
-print(f.get("as","bot"))
-' "$CONFIG" 2>/dev/null)"
-
-TARGET_TYPE="$(printf '%s' "$PARSED" | sed -n 1p)"
-TARGET_ID="$(printf '%s' "$PARSED" | sed -n 2p)"
-AS="$(printf '%s' "$PARSED" | sed -n 3p)"
-
-[ -z "$TARGET_ID" ] && { echo "feishu target_id 未配置，跳过"; exit 0; }
-
-if [ "$TARGET_TYPE" = "chat" ]; then
-  TGT="--chat-id $TARGET_ID"
-else
-  TGT="--user-id $TARGET_ID"
-fi
-
-TEXT="【$TITLE】$BODY"
-"$LARK" im +messages-send --as "$AS" $TGT --text "$TEXT" --format json 2>&1 \
-  | python3 -c 'import sys,json
+    with open(sys.argv[1], encoding='utf-8') as f:
+        cfg = json.load(f).get('feishu', {})
+except (OSError, ValueError, AttributeError):
+    fail('配置文件无法读取或格式错误')
+if not cfg.get('target_id'):
+    print('feishu skipped: target_id 未配置')
+    sys.exit(0)
+cli = os.environ.get('ACTION_REMINDER_LARK_CLI') or cfg.get('cli_path')
+if cli:
+    if not isinstance(cli, str) or not os.path.isabs(cli) or not os.access(cli, os.X_OK):
+        fail('指定 CLI 必须是可执行文件的绝对路径')
+else:
+    cli = shutil.which('lark-cli')
+    if not cli:
+        candidate = os.path.expanduser('~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli')
+        if os.access(candidate, os.X_OK):
+            cli = candidate
+if not cli:
+    fail('lark-cli 不可用')
+kind = cfg.get('target_type', 'user')
+identity = cfg.get('as', 'bot')
+if kind not in ('user', 'chat') or identity not in ('bot', 'user'):
+    fail('target_type 或发送身份无效')
 try:
-    d=json.load(sys.stdin); print("feishu ok=",d.get("ok"),"msg_id=",(d.get("data") or {}).get("message_id"))
-except Exception:
-    print("feishu send output unparsable")' 2>/dev/null || echo "feishu send failed"
+    result = subprocess.run([cli, 'im', '+messages-send', '--as', identity,
+                             '--' + kind + '-id', str(cfg['target_id']),
+                             '--text', sys.argv[2], '--format', 'json'],
+                            capture_output=True, timeout=12)
+except subprocess.TimeoutExpired:
+    fail('CLI 调用超时')
+except OSError:
+    fail('CLI 无法启动，请检查路径、权限和 CPU 架构')
+if result.returncode:
+    fail('CLI 非零退出（exit=%d；原始输出已隐藏）' % result.returncode,
+         result.returncode if result.returncode > 0 else 1)
+try:
+    data = json.loads(result.stdout)
+except (ValueError, UnicodeDecodeError):
+    fail('CLI 返回非 JSON 内容（原始输出已隐藏）')
+if not isinstance(data, dict) or data.get('ok') is not True:
+    fail('CLI 未确认成功（ok 非 true；错误详情已隐藏）')
+print('feishu ok=True')
+PY

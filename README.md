@@ -78,7 +78,7 @@ WorkBuddy 的 Hook 必须是同步、快速的，否则会卡住智能体。因�
 | `SessionEnd` | — | 会话结束 → **清除该会话全部** | 清除 |
 | `PermissionDenied` | — | 权限被拒 → **清除** | 清除 |
 
-清除逻辑按 `session_id` 或 `interaction_id` 精确匹配，多个并行任务互不干扰。
+清除逻辑优先按 `interaction_id` 精确匹配；仅当未提供交互 ID 时才按 `session_id` 清除整个会话，包含 `WAITING`、`ESCALATED` 和 `EXPIRED` 状态。多个并行任务互不干扰。
 
 ---
 
@@ -192,7 +192,7 @@ cd ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder/1.0.0/scripts
 
 - `port`：守护进程监听端口（默认 `18789`，仅 127.0.0.1）。
 - `sound`：macOS 通知提示音名称（设为空字符串 `""` 可关闭声音）。
-- `quiet_start` / `quiet_end`：静默时段起止小时（24 制，支持跨午夜，如 `23`→`8`）；期间不打扰，但仍记录待处理状态。设为 `null` 表示不静默。
+- `quiet_start` / `quiet_end`：静默时段起止小时（24 制，支持跨午夜，如 `23`→`8`）；仅关闭 macOS 本地提示音，仍弹本地通知、发送飞书提醒并记录待处理状态。设为 `null` 表示不静默。
 - `enabled`：总开关，设为 `false` 时守护进程直接退出。
 - `max_repeats`：重复提醒次数上限；用尽后状态置为 `ESCALATED`，保留待处理记录但不再弹窗。
 - `total_timeout`：单条交互最长等待秒数（默认 7200 = 2h），超时后状态置为 `EXPIRED` 并停止提醒。
@@ -243,8 +243,8 @@ macOS 通知要求人坐在电脑前；**飞书通道**让提醒经「飞书私�
 ### 11.1 前置条件
 
 - 已安装并登录飞书客户端；`lark-cli`（WorkBuddy 飞书连接器）可用且身份有效。
-- `lark-cli` 路径：优先取 `PATH` 中的 `lark-cli`，否则回退到
-  `~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli`（兼容 launchd 等窄 `PATH` 环境）。
+- `lark-cli` 路径：优先取环境变量 `ACTION_REMINDER_LARK_CLI`，其次取 `feishu.cli_path`（二者均须为本机可执行 CLI 的绝对路径）；未指定时取 `PATH`，最后回退到 `~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli`。换机后须确认 CLI 与本机 CPU 架构兼容，指定路径无效时会明确失败，不悄悄改用别的 CLI。
+- 脚本使用守护进程传入的 `ACTION_REMINDER_PYTHON`（即 `sys.executable`）；单独调用时优先 `/usr/bin/python3`，再取 `PATH` 中的 Python，避免硬编码迁移前的 managed Python 路径。
 
 ### 11.2 配置
 
@@ -293,7 +293,11 @@ grep "feishu notify" ~/.workbuddy/action-reminder/daemon.log
 
 - 飞书消息为**文本内容**（标题 + 正文），不含点击深链；点击通知聚焦 WorkBuddy 仍是 macOS 通知的能力。
 - `config.json` 含个人 `open_id`，已被仓库 `.gitignore` 忽略，**不会随仓库提交**，可放心分享仓库。
-- `notify-feishu.sh` 不使用 `set -u`：macOS 自带 `/bin/bash` 为 3.2 版，`set -u` 与 `${1:-默认值}` 组合存在已知 bug（赋值成功但后续引用报 `unbound variable`），脚本改用显式兜底守卫保证兼容。
+- 标题使用 `【${TITLE}】` 明确变量边界，避免 `$TITLE】` 在部分 locale/Bash 组合下把中文标点作为变量名的一部分；这不是 `${1:-默认值}` 与 `set -u` 的已知 bug。脚本保留严格未定义变量检查。
+- CLI 非零退出码会传回守护进程；`ok:false`、未确认成功、非 JSON 和超时均按失败处理。日志只记录安全状态，不回显 CLI 原始输出、凭据或完整命令。
+- 提醒正文按多行显示任务、待确认操作或问题、等待时长和返回 WorkBuddy 的提示，不发送完整工作目录或会话 UUID。内容来自 Hook 实际提供的 `task_title`、`tool_name`、`tool_input.description`、`question/questions`；`UserPromptSubmit.prompt` 可更新内存中的任务摘要。缺失信息会明确标记未提供，不扫描会话文件，也不推测任务。
+- 工具命令及完整参数不发送；自然语言摘要会做常见凭据、路径、命令和长标识脱敏。摘要不等同于完整会话内容，具体操作请回 WorkBuddy 核对。
+- 离线回归测试（不发送飞书或 macOS 消息）：`/usr/bin/python3 -m unittest discover -s scripts -p test_reminder.py -v`。
 
 ---
 

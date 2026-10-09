@@ -29,6 +29,7 @@ import time
 import datetime
 import hashlib
 import subprocess
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -67,6 +68,7 @@ RESOLVE_EVENTS = {
 
 lock = threading.RLock()
 pending = {}        # key -> record(dict)
+session_tasks = {}  # 仅保存 Hook 提供的已脱敏任务摘要，不扫描会话文件
 config = {}
 httpd = None
 stop_evt = threading.Event()
@@ -178,6 +180,58 @@ def stable_key(payload):
     return "key:" + digest
 
 
+def safe_summary(value, limit=180):
+    """仅发送简短自然语言；凭据、路径和命令片段不进入跨设备提醒。"""
+    if not isinstance(value, str):
+        return ""
+    value = re.sub(r"```[\s\S]*?```|`[^`]*`", "[代码已隐藏]", value)
+    value = re.sub(r"(?i)\b(?:bearer\s+\S+|(?:sk|ghp|gho|xoxb|xoxp)[-_][\w-]+)", "[凭据已隐藏]", value)
+    value = re.sub(r"(?i)(?:[\"']?(?:[\w-]*(?:token|secret|password|passwd|api[_-]?key|authorization|cookie)[\w-]*)[\"']?)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "[敏感参数已隐藏]", value)
+    value = re.sub(r"https?://\S+|(?:~?/|[A-Za-z]:\\)[^\s，。；]+", "[地址已隐藏]", value)
+    value = re.sub(r"(?i)\b(?:curl|wget|bash|zsh|sh|python3?|node|npm|git|ssh|sudo|rm)\s+[^\n]+", "[命令已隐藏]", value)
+    value = re.sub(r"--[\w-]+(?:[=\s]+[^\s，。；]+)?", "[参数已隐藏]", value)
+    value = re.sub(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b|\b[A-Za-z0-9_=-]{32,}\b", "[标识已隐藏]", value)
+    value = re.sub(r"(?i)codebuddy", "WorkBuddy", value)
+    return " ".join(value.split())[:limit]
+
+
+def context_fields(payload):
+    tool_input = payload.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    questions = payload.get("questions") or tool_input.get("questions") or []
+    question = payload.get("question") or tool_input.get("question")
+    if not question and isinstance(questions, list):
+        question = "；".join(q.get("question", "") for q in questions
+                            if isinstance(q, dict) and isinstance(q.get("question"), str))
+    return {
+        "task_title": safe_summary(payload.get("task_title") or session_tasks.get(payload.get("session_id"), "")),
+        "tool_name": safe_summary(payload.get("tool_name"), 60),
+        "operation": safe_summary(tool_input.get("description")),
+        "question": safe_summary(question),
+        "message": safe_summary(payload.get("message")),
+    }
+
+
+def reminder_body(rec, wait_sec):
+    task = safe_summary(rec.get("task_title")) or "未提供任务名称"
+    question = safe_summary(rec.get("question"))
+    tool = safe_summary(rec.get("tool_name"), 60)
+    operation = safe_summary(rec.get("operation"))
+    message = safe_summary(rec.get("message"))
+    generic = re.search(r"(?i)(?:waiting for (?:your |user )?input|needs your (?:input|attention)|等待.{0,8}输入|空闲)", message)
+    if question:
+        detail = "待回答问题：" + question
+    elif tool:
+        detail = "待确认操作：%s%s" % (tool, " — " + operation if operation else "（未提供操作说明，详细参数请在会话中查看）")
+    elif message and not generic:
+        detail = ("待确认操作：" if rec.get("type") == "permission" else "待处理内容：") + message
+    else:
+        detail = "待处理内容：等待你的输入；未提供具体操作或问题"
+    return "\n".join(["任务：" + task, detail,
+                      "等待时长：%s · 第 %d 次提醒" % (fmt_wait(wait_sec), rec.get("reminder_count", 0) + 1),
+                      "请返回 WorkBuddy 对应会话处理。"])
+
+
 # ---------------------------------------------------------------------------
 # macOS 通知
 # ---------------------------------------------------------------------------
@@ -234,17 +288,21 @@ def notify_feishu(title, body):
     if not os.path.exists(script):
         return
     try:
+        env = dict(os.environ, ACTION_REMINDER_PYTHON=sys.executable,
+                   ACTION_REMINDER_CONFIG=CONFIG_FILE)
         res = subprocess.run(["/bin/bash", script, title or "", body or ""],
-                             capture_output=True, timeout=15)
-        out = res.stdout.decode("utf-8", "ignore").strip()
-        if out:
-            log("feishu notify: %s" % out)
+                             capture_output=True, timeout=15, env=env)
         if res.returncode != 0:
-            err = res.stderr.decode("utf-8", "ignore").strip()
-            if err:
-                log("feishu notify stderr: %s" % err[:200])
-    except Exception as e:
-        log("feishu notify failed: %s" % e)
+            log("feishu notify failed: exit=%d" % res.returncode)
+            return False
+        if res.stdout.decode("utf-8", "replace").strip() != "feishu ok=True":
+            log("feishu notify skipped: 未确认发送成功")
+            return False
+        log("feishu notify: feishu ok=True")
+        return True
+    except Exception:
+        log("feishu notify failed: 调用异常或超时（原始参数已隐藏）")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +317,7 @@ def create_pending(payload):
         if rec and rec.get("status") == "WAITING":
             # 已存在且等待中：刷新最后出现时间，避免重复创建
             rec["last_seen"] = now_ts()
-            rec["message"] = payload.get("message", rec.get("message", ""))
+            rec.update({k: v for k, v in context_fields(payload).items() if v})
             save_state()
             return key, rec, False
         rec = {
@@ -278,6 +336,7 @@ def create_pending(payload):
             "reminder_count": 0,
             "status": "WAITING",
         }
+        rec.update(context_fields(payload))
         pending[key] = rec
         save_state()
         # 首次提醒（含飞书通道）必须在此处与调度状态原子更新：
@@ -297,9 +356,15 @@ def resolve(payload):
             if k in pending:
                 target_keys.append(k)
         sid = payload.get("session_id")
-        if sid:
+        if sid and payload.get("event") == "UserPromptSubmit":
+            task = safe_summary(payload.get("task_title") or payload.get("prompt"))
+            if task and (sid not in session_tasks or payload.get("task_title")):
+                session_tasks[sid] = task
+        if sid and payload.get("event") == "SessionEnd":
+            session_tasks.pop(sid, None)
+        if sid and not iid:
             for k, rec in list(pending.items()):
-                if rec.get("session_id") == sid and rec.get("status") == "WAITING":
+                if rec.get("session_id") == sid:
                     target_keys.append(k)
         removed = []
         for k in set(target_keys):
@@ -315,27 +380,11 @@ def resolve(payload):
 def send_reminder(key, rec, first=False):
     etype = rec.get("type", "idle")
     label = {"permission": "需要权限确认", "idle": "等待你的输入", "elicitation": "需要补充信息"}.get(etype, "待处理")
-    title = "WorkBuddy · 待操作提醒"
+    title = "WorkBuddy｜" + label
     subtitle = label
     wait_sec = now_ts() - rec.get("created_at", now_ts())
     count = rec.get("reminder_count", 0)
-    session = rec.get("session_id") or "未知会话"
-    cwd = rec.get("cwd") or ""
-    msg = rec.get("message") or ""
-    body_parts = []
-    if msg:
-        body_parts.append(msg)
-    body_parts.append("会话：%s" % session)
-    if cwd:
-        body_parts.append("目录：%s" % cwd)
-    body_parts.append("已等待 %s" % fmt_wait(wait_sec))
-    with lock:
-        total = sum(1 for r in pending.values() if r.get("status") == "WAITING")
-    if total > 1:
-        body_parts.append("当前共有 %d 项待处理" % total)
-    if not first and count >= 1:
-        body_parts.append("（第 %d 次提醒，点击聚焦 WorkBuddy）" % count)
-    body = " | ".join(body_parts)
+    body = reminder_body(rec, wait_sec)
     notify(title, subtitle, body, group="wb-ar-" + key, sound=not in_quiet_hours())
     # 飞书通道：跨设备可达（离开 Mac 也能在手机/桌面收到）
     notify_feishu(title, body)
@@ -371,6 +420,7 @@ def scheduler_loop():
                     rec["next_reminder_at"] = None
                     rec["status"] = "EXPIRED"
                     log("EXPIRED pending %s (total timeout)" % k)
+                    save_state()
                     continue
                 send_reminder(k, rec)
         time.sleep(0.05)
