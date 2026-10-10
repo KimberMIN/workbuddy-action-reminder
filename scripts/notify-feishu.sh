@@ -14,10 +14,12 @@ if [ -z "$PYTHON" ]; then
   fi
 fi
 [ -n "$PYTHON" ] || { printf '%s\n' 'feishu failed: Python 不可用' >&2; exit 1; }
-TEXT="【${TITLE}】
-${BODY}"
-exec "$PYTHON" - "$CONFIG" "$TEXT" <<'PY'
+LINK="${3:-}"
+exec "$PYTHON" - "$CONFIG" "$TITLE" "$BODY" "$LINK" <<'PY'
 import json
+import re
+import string
+from urllib.parse import quote, unquote
 import os
 import shutil
 import subprocess
@@ -29,6 +31,72 @@ def fail(reason, code=1):
     print('feishu failed: ' + reason, file=sys.stderr)
     sys.exit(code)
 
+
+title, body, link = sys.argv[2:5]
+ack = None
+raw_ack = os.environ.get('ACTION_REMINDER_ACK_VALUE', '')
+if raw_ack:
+    try:
+        ack = json.loads(raw_ack)
+    except ValueError:
+        fail('已处理按钮参数无效')
+    if (not isinstance(ack, dict) or ack.get('action') != 'ack_reminder'
+            or set(ack) != {'action', 'reminder_token', 'generation'}
+            or not isinstance(ack.get('reminder_token'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{43}', ack['reminder_token'])
+            or not isinstance(ack.get('generation'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', ack['generation'])):
+        fail('已处理按钮参数无效')
+if link:
+    # 固定 scheme/host/单个编码路径段；拒绝查询、片段、畸形编码和控制字符。
+    if not re.fullmatch(r"workbuddy://chat/(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-F]{2})+", link):
+        fail('任务链接无效')
+    encoded_id = link[len('workbuddy://chat/'):]
+    try:
+        session_id = unquote(encoded_id, errors='strict')
+        valid = (session_id.strip() and session_id not in ('.', '..')
+                 and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in session_id)
+                 and quote(session_id, safe="-_.!~*'()") == encoded_id)
+    except UnicodeError:
+        valid = False
+    if not valid:
+        fail('任务链接无效')
+
+    # 飞书 Markdown 用 HTML 实体展示特殊字符；单次逐字符处理防止实体注入。
+    escaped_body = ''.join('&#%d;' % ord(c) if c in string.punctuation else c for c in body)
+    card = {
+        'schema': '2.0',
+        'config': {'width_mode': 'default'},
+        'header': {'template': 'blue', 'title': {'tag': 'plain_text', 'content': title}},
+        'body': {'direction': 'vertical', 'vertical_spacing': '12px',
+                 'padding': '12px 12px 20px 12px', 'elements': [
+            {'tag': 'column_set', 'flex_mode': 'none', 'columns': [
+                {'tag': 'column', 'width': 'weighted', 'weight': 1,
+                 'background_style': 'blue-50', 'padding': '12px',
+                 'elements': [{'tag': 'markdown', 'content': '**任务详情**\n' + escaped_body}]}]},
+            {'tag': 'column_set', 'flex_mode': 'none', 'horizontal_spacing': '8px',
+             'columns': []},
+            {'tag': 'markdown', 'text_size': 'notation',
+             'content': '<font color="grey">打开任务会唤起运行提醒服务的 Mac（手机点击也一样）；已处理仅停止本条提醒，不批准操作。</font>'}
+        ]}
+    }
+    for label, action, style in [('打开对应任务', 'open_reminder', 'primary_filled'),
+                                  ('已处理', 'ack_reminder', 'default')]:
+        button = {'tag': 'button', 'type': style, 'width': 'fill',
+                  'text': {'tag': 'plain_text', 'content': label}, 'behaviors': []}
+        if ack:
+            button['behaviors'] = [{'type': 'callback', 'value': dict(ack, action=action)}]
+        else:
+            button.update(disabled=True, disabled_tips={
+                'tag': 'plain_text', 'content': '提醒服务尚未连接，请回 Mac 处理'})
+        card['body']['elements'][1]['columns'].append({
+            'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [button]})
+    if not ack:
+        card['body']['elements'][-1]['content'] = (
+            '<font color="grey">提醒服务尚未连接，按钮暂不可用，请回 Mac 的 WorkBuddy 处理。</font>')
+    content_args = ['--msg-type', 'interactive', '--content', json.dumps(card, ensure_ascii=False)]
+else:
+    content_args = ['--text', '【%s】\n%s' % (title, body)]
 
 try:
     with open(sys.argv[1], encoding='utf-8') as f:
@@ -57,7 +125,7 @@ if kind not in ('user', 'chat') or identity not in ('bot', 'user'):
 try:
     result = subprocess.run([cli, 'im', '+messages-send', '--as', identity,
                              '--' + kind + '-id', str(cfg['target_id']),
-                             '--text', sys.argv[2], '--format', 'json'],
+                             '--format', 'json'] + content_args,
                             capture_output=True, timeout=12)
 except subprocess.TimeoutExpired:
     fail('CLI 调用超时')

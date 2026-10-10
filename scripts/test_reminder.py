@@ -1,4 +1,5 @@
 """离线回归测试：所有通知均被替换，不访问飞书或真实守护进程。"""
+import html
 import importlib.util
 import json
 import os
@@ -6,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch, Mock
 
@@ -39,7 +42,7 @@ class ReminderTests(unittest.TestCase):
         self.create(message='CodeBuddy is waiting for your input')
         title, body = self.mocks[-1].call_args.args
         self.assertEqual(title, 'WorkBuddy｜等待你的输入')
-        for text in ('任务：未提供任务名称', '未提供具体操作或问题', '等待时长：', '请返回 WorkBuddy 对应会话处理'):
+        for text in ('任务：未获取原始任务名称', '未提供具体操作或问题', '等待时长：', '请返回 WorkBuddy 对应会话处理'):
             self.assertIn(text, body)
         for text in ('CodeBuddy', 'session-private', '/Users/private', '点击'):
             self.assertNotIn(text, body)
@@ -64,6 +67,43 @@ class ReminderTests(unittest.TestCase):
         for secret in ('TOP_SECRET', 'HIDDEN PASS', 'abcdef', 'https://', 'curl ', 'CodeBuddy'):
             self.assertNotIn(secret, text)
         self.assertIn('WorkBuddy', text)
+
+    def test_short_prompts_never_become_task_title(self):
+        for prompt in ('已点击', '继续', '好的', '继续执行。', 'OK!', '确认执行', '已处理'):
+            d.session_tasks.clear()
+            d.resolve({'event': 'UserPromptSubmit', 'session_id': 's', 'prompt': prompt})
+            self.assertNotIn('s', d.session_tasks)
+            self.assertIn('未获取原始任务名称', d.reminder_body({'task_title': prompt}, 0))
+            self.assertEqual(d.context_fields({'task_title': prompt})['task_title'], '')
+        d.session_tasks['s'] = '修复登录页面'
+        d.resolve({'event': 'UserPromptSubmit', 'session_id': 's', 'task_title': '已点击'})
+        self.assertEqual(d.session_tasks['s'], '修复登录页面')
+
+    def test_address_placeholder_is_not_task_title(self):
+        for text in ('[地址已隐藏]', '/Users/private/screenshot.png', 'https://example.invalid/image.png'):
+            self.assertEqual(d.task_summary(text), '')
+            self.assertIn('未获取原始任务名称', d.reminder_body({'task_title': text}, 0))
+        self.assertEqual(d.task_summary('检查截图 /Users/private/screenshot.png'), '检查截图 [地址已隐藏]')
+
+    def test_readonly_preview_does_not_create_or_resolve(self):
+        rec = self.create(session_id='current-real-sid')
+        before = json.dumps(d.pending, sort_keys=True)
+        saved = Path(d.STATE_FILE).read_bytes()
+        handler = object.__new__(d.Handler)
+        handler._send = Mock()
+        handler.path = '/preview-existing?session_id=current-real-sid'
+        handler.do_GET()
+        data = handler._send.call_args.args[1]
+        self.assertFalse(data['created'])
+        self.assertEqual(data['records'][0]['key'], rec['key'])
+        self.assertEqual(data['records'][0]['link'], 'workbuddy://chat/current-real-sid')
+        for field in ('reminder_token', 'generation', 'ack_operator_id'):
+            self.assertNotIn(field, json.dumps(data))
+        handler.path = '/preview-existing?session_id=absent'
+        handler.do_GET()
+        self.assertEqual(handler._send.call_args.args[1]['records'], [])
+        self.assertEqual(json.dumps(d.pending, sort_keys=True), before)
+        self.assertEqual(Path(d.STATE_FILE).read_bytes(), saved)
 
     def test_user_prompt_context_and_resolve(self):
         self.create(interaction_id='old')
@@ -110,8 +150,228 @@ class ReminderTests(unittest.TestCase):
         self.assertNotIn('TOP_SECRET', Path(d.LOG_FILE).read_text())
 
 
+    def test_session_id_forwarded_without_using_interaction_id(self):
+        self.create(session_id='parent-session', interaction_id='child-interaction')
+        self.assertEqual(self.mocks[-1].call_args.kwargs, {'session_id': 'parent-session'})
+
+    def test_session_deeplink_encoding(self):
+        self.assertEqual(d.session_deeplink("任务 /?#%&=+!'()*~._-"),
+                         "workbuddy://chat/%E4%BB%BB%E5%8A%A1%20%2F%3F%23%25%26%3D%2B!'()*~._-")
+        self.assertEqual(d.session_deeplink('abc%2Fdef'), 'workbuddy://chat/abc%252Fdef')
+
+    def test_invalid_session_id_has_no_link(self):
+        for sid in (None, '', ' ', 123, {}, [], '.', '..', 'a\n', 'a\x00', 'a\x7f', 'a\x85', '\ud800'):
+            with self.subTest(sid=repr(sid)):
+                self.assertEqual(d.session_deeplink(sid), '')
+
+    def test_daemon_passes_link_and_empty_fallback(self):
+        self.patches[-1].stop()
+        d.config = {'feishu': {'enabled': True, 'target_id': 'mock'}}
+        with patch.object(d.subprocess, 'run', return_value=Mock(returncode=0, stdout=b'feishu ok=True\n')) as run:
+            for sid in ('parent /任务', None):
+                self.assertTrue(d.notify_feishu('标题', '正文', session_id=sid))
+                self.assertEqual(run.call_args.args[0][-1], d.session_deeplink(sid))
+
+
+class AcknowledgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in [('STATE_FILE', self.tmp.name + '/state.json'),
+                            ('LOG_FILE', self.tmp.name + '/daemon.log'),
+                            ('ACK_CALLBACK_READY', True),
+                            ('callback_process', Mock(poll=Mock(return_value=None))),
+                            ('stop_evt', threading.Event())]:
+            p = patch.object(d, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ('notify', 'notify_feishu'):
+            p = patch.object(d, name, return_value=True)
+            setattr(self, name, p.start())
+            self.addCleanup(p.stop)
+        d.pending = {}
+        d.session_tasks = {}
+        d.config = {'feishu': {'target_type': 'user', 'target_id': 'ou_target'}}
+        self.payload = {'event': 'PermissionRequest', 'interaction_id': 'a', 'session_id': 's'}
+        self.rec = d.create_pending(self.payload)[1]
+        self.event = {'type': 'card.action.trigger', 'action_tag': 'button',
+                      'operator_id': 'ou_target', 'action_value': json.dumps({
+                          'action': 'ack_reminder', 'reminder_token': self.rec['reminder_token'],
+                          'generation': self.rec['generation']})}
+
+    def test_gate_disabled(self):
+        with patch.object(d, 'ACK_CALLBACK_READY', False):
+            self.assertFalse(d.acknowledge_card(self.event))
+        self.assertEqual(self.rec['status'], 'WAITING')
+
+    def test_token_unique_and_unpredictable_shape(self):
+        other = d.create_pending(dict(self.payload, interaction_id='b'))[1]
+        self.assertRegex(self.rec['reminder_token'], r'^[A-Za-z0-9_-]{43}$')
+        self.assertNotEqual(self.rec['reminder_token'], other['reminder_token'])
+        value = json.loads(self.event['action_value'])
+        value['reminder_token'] = 'x' * 43
+        self.assertFalse(d.acknowledge_card(dict(self.event, action_value=json.dumps(value))))
+
+    def test_only_target_operator(self):
+        for operator in ('ou_other', '', None):
+            self.assertFalse(d.acknowledge_card(dict(self.event, operator_id=operator)))
+        self.rec['ack_operator_id'] = ''
+        self.assertFalse(d.acknowledge_card(self.event))
+
+    def test_old_generation_rejected(self):
+        self.rec['generation'] = '0' * 32
+        self.assertFalse(d.acknowledge_card(self.event))
+        self.assertEqual(self.rec['status'], 'WAITING')
+
+    def test_idempotent_and_no_notifications_or_commands(self):
+        self.notify.reset_mock()
+        self.notify_feishu.reset_mock()
+        with patch.object(d.subprocess, 'run') as run:
+            self.assertTrue(d.acknowledge_card(self.event))
+            saved = Path(d.STATE_FILE).read_bytes()
+            self.assertTrue(d.acknowledge_card(self.event))
+            d.send_reminder(self.rec['key'], self.rec)
+            run.assert_not_called()
+        self.assertEqual(Path(d.STATE_FILE).read_bytes(), saved)
+        self.assertIsNone(self.rec['next_reminder_at'])
+        self.notify.assert_not_called()
+        self.notify_feishu.assert_not_called()
+
+    def test_restart_persistence_and_duplicate_hook(self):
+        self.assertTrue(d.acknowledge_card(self.event))
+        d.pending = {}
+        d.load_state()
+        self.notify.reset_mock()
+        self.notify_feishu.reset_mock()
+        _, rec, created = d.create_pending(self.payload)
+        self.assertFalse(created)
+        self.assertEqual(rec['status'], 'ACKED')
+        self.assertTrue(d.acknowledge_card(self.event))
+        self.notify.assert_not_called()
+        self.notify_feishu.assert_not_called()
+        self.assertEqual(os.stat(d.STATE_FILE).st_mode & 0o777, 0o600)
+
+    def test_other_record_and_new_occurrence_unaffected(self):
+        other = d.create_pending(dict(self.payload, interaction_id='b'))[1]
+        self.assertTrue(d.acknowledge_card(self.event))
+        self.assertEqual(other['status'], 'WAITING')
+        d.resolve({'interaction_id': 'a'})
+        new = d.create_pending(self.payload)[1]
+        self.assertNotEqual(new['generation'], self.rec['generation'])
+        self.assertFalse(d.acknowledge_card(self.event))
+        self.assertEqual(new['status'], 'WAITING')
+
+    def test_same_fallback_key_until_lifecycle_boundary(self):
+        payload = {'event': 'idle_prompt', 'session_id': 'fallback', 'message': '等待输入'}
+        rec = d.create_pending(payload)[1]
+        event = dict(self.event, action_value=json.dumps({
+            'action': 'ack_reminder', 'reminder_token': rec['reminder_token'],
+            'generation': rec['generation']}))
+        self.assertTrue(d.acknowledge_card(event))
+        self.assertFalse(d.create_pending(payload)[2])
+        d.resolve({'event': 'UserPromptSubmit', 'session_id': 'fallback'})
+        self.assertTrue(d.create_pending(payload)[2])
+        self.assertFalse(d.acknowledge_card(event))
+
+    def test_write_failure_not_acknowledged(self):
+        with patch.object(d.os, 'replace', side_effect=OSError):
+            self.assertFalse(d.acknowledge_card(self.event))
+        self.assertEqual(self.rec['status'], 'WAITING')
+        self.assertEqual(json.loads(Path(d.STATE_FILE).read_text())[self.rec['key']]['status'], 'WAITING')
+
+    def test_malformed_and_approval_actions_rejected(self):
+        for value in ('not-json', 'null', '[]', '{}', 7, json.dumps({
+                'action': 'approve', 'reminder_token': self.rec['reminder_token'],
+                'generation': self.rec['generation']}), json.dumps({
+                'action': 'ack_reminder', 'reminder_token': '中文', 'generation': 'x'})):
+            self.assertFalse(d.acknowledge_card(dict(self.event, action_value=value)))
+        self.assertFalse(d.acknowledge_card(dict(self.event, action_tag='input')))
+        self.assertFalse(d.acknowledge_card(dict(self.event, type='other')))
+
+
+class OpenCallbackTests(unittest.TestCase):
+    setUp = AcknowledgeTests.setUp
+
+    def open_event(self, **extra):
+        value = dict(json.loads(self.event['action_value']), action='open_reminder', **extra)
+        return dict(self.event, action_value=json.dumps(value))
+
+    def test_open_no_shell_no_ack_no_other_changes(self):
+        other = d.create_pending(dict(self.payload, interaction_id='b'))[1]
+        self.rec['session_id'] = "实际 /任务;$(touch bad)"
+        before = json.dumps(d.pending, sort_keys=True)
+        saved = Path(d.STATE_FILE).read_bytes()
+        self.notify.reset_mock()
+        self.notify_feishu.reset_mock()
+        with patch.object(d.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+            self.assertTrue(d.acknowledge_card(self.open_event()))
+            run.assert_called_once_with(['/usr/bin/open', d.session_deeplink(self.rec['session_id'])],
+                                        shell=False, capture_output=True, timeout=10)
+        self.assertEqual(json.dumps(d.pending, sort_keys=True), before)
+        self.assertEqual(Path(d.STATE_FILE).read_bytes(), saved)
+        self.assertEqual(other['status'], 'WAITING')
+        self.notify.assert_not_called()
+        self.notify_feishu.assert_not_called()
+
+    def test_ack_then_open_does_not_restore_reminder(self):
+        self.assertTrue(d.acknowledge_card(self.event))
+        with patch.object(d.subprocess, 'run', return_value=Mock(returncode=0)):
+            self.assertTrue(d.acknowledge_card(self.open_event()))
+        self.assertEqual(self.rec['status'], 'ACKED')
+        self.assertIsNone(self.rec['next_reminder_at'])
+
+    def test_open_rejects_identity_old_token_and_generation(self):
+        with patch.object(d.subprocess, 'run') as run:
+            for operator in ('ou_other', '', None):
+                self.assertFalse(d.acknowledge_card(dict(self.open_event(), operator_id=operator)))
+            for field, value in [('reminder_token', 'z' * 43), ('generation', '0' * 32)]:
+                event = self.open_event()
+                data = json.loads(event['action_value']); data[field] = value
+                self.assertFalse(d.acknowledge_card(dict(event, action_value=json.dumps(data))))
+            d.config['feishu']['target_id'] = 'ou_changed'
+            self.assertFalse(d.acknowledge_card(self.open_event()))
+            run.assert_not_called()
+
+    def test_open_rejects_payload_url_and_approval(self):
+        with patch.object(d.subprocess, 'run') as run:
+            for url in ('https://evil.invalid', 'file:///tmp/x', 'workbuddy://chat/other', '; touch bad'):
+                self.assertFalse(d.acknowledge_card(self.open_event(url=url)))
+            self.assertFalse(d.acknowledge_card(self.open_event(session_id='other')))
+            run.assert_not_called()
+
+    def test_open_after_resolve_and_missing_session_rejected(self):
+        with patch.object(d.subprocess, 'run') as run:
+            self.rec['session_id'] = None
+            self.assertFalse(d.acknowledge_card(self.open_event()))
+            self.rec['session_id'] = 's'
+            event = self.open_event()
+            d.resolve({'interaction_id': 'a'})
+            d.create_pending(self.payload)
+            self.assertFalse(d.acknowledge_card(event))
+            run.assert_not_called()
+
+    def test_open_group_requires_configured_operator(self):
+        d.config['feishu'] = {'target_type': 'chat', 'target_id': 'oc_group'}
+        with patch.object(d.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+            self.assertFalse(d.acknowledge_card(self.open_event()))
+            run.assert_not_called()
+            d.config['feishu']['ack_operator_id'] = 'ou_target'
+            self.assertTrue(d.acknowledge_card(self.open_event()))
+
+    def test_open_failures_and_disconnected_gate(self):
+        for result in (Mock(returncode=1), OSError(), subprocess.TimeoutExpired('open', 10)):
+            with patch.object(d.subprocess, 'run', **({'side_effect': result} if isinstance(result, Exception)
+                                                      else {'return_value': result})):
+                self.assertFalse(d.acknowledge_card(self.open_event()))
+        with patch.object(d, 'callback_process', None), patch.object(d.subprocess, 'run') as run:
+            self.assertFalse(d.acknowledge_card(self.open_event()))
+            run.assert_not_called()
+        self.assertEqual(self.rec['status'], 'WAITING')
+
+
 class FeishuScriptTests(unittest.TestCase):
-    def run_script(self, response='{"ok": true}', exit_code=0, override=True):
+    def run_script(self, response='{"ok": true}', exit_code=0, override=True,
+                   link=None, body='任务：中文测试\n请返回 WorkBuddy', ack=None):
         with tempfile.TemporaryDirectory() as tmp:
             cli = Path(tmp) / 'mock-cli'
             output = Path(tmp) / 'args.json'
@@ -123,17 +383,104 @@ class FeishuScriptTests(unittest.TestCase):
             cfg.write_text(json.dumps({'feishu': {'target_id': 'mock-target', 'cli_path': str(cli)}}))
             env = dict(os.environ, ACTION_REMINDER_CONFIG=str(cfg), ACTION_REMINDER_PYTHON=sys.executable)
             env.pop('ACTION_REMINDER_LARK_CLI', None)
+            env.pop('ACTION_REMINDER_ACK_VALUE', None)
+            if ack is not None:
+                env['ACTION_REMINDER_ACK_VALUE'] = json.dumps(ack)
             if override:
                 env['ACTION_REMINDER_LARK_CLI'] = str(cli)
-            result = subprocess.run(['/bin/bash', str(ROOT / 'notify-feishu.sh'), 'WorkBuddy · 待操作提醒', '任务：中文测试\n请返回 WorkBuddy'],
-                                    env=env, capture_output=True, text=True)
-            args = json.loads(output.read_text())
+            command = ['/bin/bash', str(ROOT / 'notify-feishu.sh'), 'WorkBuddy · 待操作提醒', body]
+            if link is not None:
+                command.append(link)
+            result = subprocess.run(command, env=env, capture_output=True, text=True)
+            args = json.loads(output.read_text()) if output.exists() else None
             return result, args
 
     def test_title_and_config_cli(self):
         result, args = self.run_script(override=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(args[args.index('--text') + 1], '【WorkBuddy · 待操作提醒】\n任务：中文测试\n请返回 WorkBuddy')
+
+    def test_card_structure_and_encoded_link(self):
+        link = d.session_deeplink("父会话 /?#%!'()")
+        result, args = self.run_script(link=link)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('--text', args)
+        self.assertEqual(args[args.index('--msg-type') + 1], 'interactive')
+        card = json.loads(args[args.index('--content') + 1])
+        self.assertEqual(card['schema'], '2.0')
+        self.assertEqual(card['config']['width_mode'], 'default')
+        self.assertEqual(card['header']['template'], 'blue')
+        self.assertEqual(card['header']['title'], {'tag': 'plain_text', 'content': 'WorkBuddy · 待操作提醒'})
+        elements = card['body']['elements']
+        self.assertEqual([e['tag'] for e in elements], ['column_set', 'column_set', 'markdown'])
+        self.assertEqual(elements[0]['columns'][0]['tag'], 'column')
+        for column in elements[1]['columns']:
+            button = column['elements'][0]
+            self.assertTrue(button['disabled'])
+            self.assertEqual(button['behaviors'], [])
+        self.assertIn('按钮暂不可用', elements[2]['content'])
+
+    def test_callback_buttons_equal_width(self):
+        ack = {'action': 'ack_reminder', 'reminder_token': 'a' * 43, 'generation': 'b' * 32}
+        result, args = self.run_script(link='workbuddy://chat/test', ack=ack)
+        self.assertEqual(result.returncode, 0)
+        elements = json.loads(args[args.index('--content') + 1])['body']['elements']
+        row = elements[1]
+        self.assertEqual(row['flex_mode'], 'none')
+        self.assertEqual(len(row['columns']), 2)
+        for column, label, action in zip(row['columns'], ['打开对应任务', '已处理'],
+                                          ['open_reminder', 'ack_reminder']):
+            self.assertEqual((column['width'], column['weight']), ('weighted', 1))
+            button = column['elements'][0]
+            self.assertEqual(button['width'], 'fill')
+            self.assertEqual(button['text']['content'], label)
+            self.assertEqual(button['behaviors'], [{'type': 'callback', 'value': dict(ack, action=action)}])
+        self.assertNotIn('workbuddy://', json.dumps(elements))
+        self.assertNotIn('ou_', json.dumps(elements))
+        self.assertIn('手机点击也一样', elements[2]['content'])
+
+    def test_bad_callback_value_rejected(self):
+        for ack in ({}, [], {'action': 'approve'}, {'action': 'ack_reminder',
+                    'reminder_token': 'a' * 43, 'generation': 'b' * 32, 'operator_id': 'ou_x'}):
+            result, args = self.run_script(link='workbuddy://chat/test', ack=ack)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIsNone(args)
+
+    def test_markdown_injection_escaped(self):
+        body = '<at id=all></at> [点击](https://example.invalid) ![图](x) **粗** `代码`\n# 标题 &lt;at&gt; \\ :OK:'
+        result, args = self.run_script(link='workbuddy://chat/test', body=body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        card = json.loads(args[args.index('--content') + 1])
+        text = card['body']['elements'][0]['columns'][0]['elements'][0]['content']
+        escaped = text.removeprefix('**任务详情**\n')
+        self.assertEqual(html.unescape(escaped), body)
+        for token in ('<at', '[点击]', 'https:', '**粗**', '`代码`', '# 标题', '&lt;', ':OK:'):
+            self.assertNotIn(token, escaped)
+
+    def test_invalid_urls_rejected_before_cli(self):
+        for link in ('https://example.invalid', 'file:///tmp/test', 'javascript:alert(1)',
+                     'workbuddy://task/id', 'WORKBUDDY://chat/id', 'workbuddy://chat/',
+                     'workbuddy://chat/id/other', 'workbuddy://chat/id?x=1',
+                     'workbuddy://chat/id#x', 'workbuddy://chat/id\n',
+                     'workbuddy://chat/a b', 'workbuddy://chat/任务',
+                     'workbuddy://chat/%', 'workbuddy://chat/%GG', 'workbuddy://chat/%FF',
+                     'workbuddy://chat/%00', 'workbuddy://chat/%0A', 'workbuddy://chat/%C2%85',
+                     'workbuddy://chat/.', 'workbuddy://chat/..', 'workbuddy://chat/%2E%2E',
+                     'workbuddy://chat/%20', 'workbuddy://chat/%61', 'workbuddy://chat/%2f',
+                     'workbuddy://chat@evil/id', 'workbuddy://chat:80/id'):
+            with self.subTest(link=link):
+                result, args = self.run_script(link=link)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(args)
+                self.assertNotIn(link, result.stderr)
+
+    def test_empty_link_falls_back_to_text(self):
+        result, args = self.run_script(link='')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--text', args)
+        self.assertNotIn('--content', args)
+        self.assertNotIn('--msg-type', args)
+        self.assertNotIn('workbuddy://', ' '.join(args))
 
     def test_nonzero_preserved_and_output_hidden(self):
         result, _ = self.run_script('TOP_SECRET', 7)
@@ -149,6 +496,233 @@ class FeishuScriptTests(unittest.TestCase):
         result, _ = self.run_script('TOP_SECRET')
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('TOP_SECRET', result.stdout + result.stderr)
+
+
+class ListenerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in [('stop_evt', threading.Event()), ('ACK_CALLBACK_READY', False),
+                            ('callback_process', None), ('LOG_FILE', self.tmp.name + '/log'),
+                            ('STATE_FILE', self.tmp.name + '/state')]:
+            p = patch.object(d, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        d.pending = {}
+        d.config = {'feishu': {'enabled': True, 'as': 'bot', 'ack_callback_enabled': True,
+                              'cli_path': sys.executable, 'target_id': 'ou_test'}}
+
+    def wait_until(self, check):
+        deadline = time.monotonic() + 4
+        while not check() and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertTrue(check())
+
+    def start_consumer(self):
+        # 实际子进程和管道模拟 CLI；stdin 保持打开，指令触发对应输出。
+        proc = subprocess.Popen([sys.executable, '-u', '-c',
+            'import sys\nfor line in sys.stdin:\n'
+            ' if line.startswith("ERR "): print(line[4:].rstrip(), file=sys.stderr, flush=True)\n'
+            ' else: print(line.rstrip(), flush=True)\n'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = proc
+        def cleanup():
+            d.stop_evt.set()
+            if not proc.stdin.closed:
+                proc.stdin.close()
+            proc.wait(timeout=4)
+            self.thread.join(timeout=4)
+            proc.stdout.close()
+            proc.stderr.close()
+        self.addCleanup(cleanup)
+        self.popen = patch.object(d.subprocess, 'Popen', return_value=proc)
+        self.mock_popen = self.popen.start()
+        self.addCleanup(self.popen.stop)
+        self.thread = threading.Thread(target=d.callback_listener_loop)
+        self.thread.start()
+        self.wait_until(lambda: d.callback_process is proc)
+
+    def emit(self, text):
+        self.proc.stdin.write((text + '\n').encode())
+        self.proc.stdin.flush()
+
+    def ready(self):
+        self.emit('ERR ' + d.CALLBACK_READY_MARKER.decode())
+        self.wait_until(d.callback_ready)
+
+    def test_real_pipes_ready_schema_ack_duplicate_restart(self):
+        with patch.object(d, 'notify'), patch.object(d, 'notify_feishu'):
+            payload = {'event': 'PermissionRequest', 'interaction_id': 'test', 'session_id': 's'}
+            rec = d.create_pending(payload)[1]
+        self.start_consumer()
+        self.assertFalse(d.callback_ready())
+        self.assertFalse(self.proc.stdin.closed)
+        self.assertEqual(self.mock_popen.call_args.args[0][1:],
+                         ['event', 'consume', 'card.action.trigger', '--as', 'bot'])
+        self.assertEqual(self.mock_popen.call_args.kwargs['stdin'], subprocess.PIPE)
+        self.ready()
+        value = {'action': 'ack_reminder', 'reminder_token': rec['reminder_token'],
+                 'generation': rec['generation']}
+        event = {'type': 'card.action.trigger', 'event_id': 'test-event',
+                 'timestamp': '1791500000000', 'operator_id': 'ou_test',
+                 'message_id': 'om_test', 'chat_id': 'oc_test', 'host': 'im_message',
+                 'token': 'UNUSED_DELAY_TOKEN', 'action_tag': 'button',
+                 'action_value': json.dumps(value), 'action_name': '', 'form_value': '',
+                 'card_content': ''}
+        self.emit('ERR Event received: type=card.action.trigger id=PRIVATE_EVENT_ID')
+        self.emit('ERR [event] logs: /private/log')
+        self.emit('not-json')
+        self.emit(json.dumps({'event': event}))
+        self.emit(json.dumps(dict(event, operator_id='ou_other')))
+        self.emit(json.dumps(event))
+        self.wait_until(lambda: rec['status'] == 'ACKED')
+        self.emit(json.dumps(event))
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertFalse(self.thread.is_alive())
+        self.assertFalse(d.ACK_CALLBACK_READY)
+        self.assertIsNotNone(self.proc.poll())
+        d.pending = {}
+        d.load_state()
+        with patch.object(d, 'notify') as notify, patch.object(d, 'notify_feishu') as send:
+            self.assertFalse(d.create_pending(payload)[2])
+            notify.assert_not_called()
+            send.assert_not_called()
+        self.assertNotIn('UNUSED_DELAY_TOKEN', Path(d.LOG_FILE).read_text())
+        self.assertNotIn('ou_test', Path(d.LOG_FILE).read_text())
+        self.assertNotIn('PRIVATE_EVENT_ID', Path(d.LOG_FILE).read_text())
+
+    def test_connected_diagnostic_keeps_same_consumer_alive(self):
+        self.start_consumer()
+        self.ready()
+        with patch.object(d, 'acknowledge_card') as ack:
+            self.emit('ERR [source] feishu-websocket: connected')
+            self.emit('{"type":"probe"}')
+            self.wait_until(lambda: ack.called)
+            self.assertTrue(d.callback_ready())
+            self.assertIsNone(self.proc.poll())
+            self.assertFalse(self.proc.stdin.closed)
+            self.assertEqual(self.mock_popen.call_count, 1)
+
+    def test_connected_without_ready_cannot_open_gate(self):
+        self.start_consumer()
+        consumed = threading.Event()
+        real_read = os.read
+        def observe_read(fd, size):
+            chunk = real_read(fd, size)
+            if b'[source] feishu-websocket: connected' in chunk:
+                consumed.set()
+            return chunk
+        with patch.object(d.os, 'read', side_effect=observe_read):
+            self.emit('ERR [source] feishu-websocket: connected')
+            self.assertTrue(consumed.wait(4))
+            self.assertFalse(d.callback_ready())
+        self.ready()
+        self.assertEqual(Path(d.LOG_FILE).read_text().count('ready event_key='), 1)
+
+    def test_source_disconnect_closes_gate_while_process_alive(self):
+        self.start_consumer()
+        self.ready()
+        self.assertIsNone(self.proc.poll())
+        self.emit('ERR [source] feishu-websocket: disconnected (TOP_SECRET)')
+        self.wait_until(lambda: not d.ACK_CALLBACK_READY)
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertIsNotNone(self.proc.poll())
+        self.assertNotIn('TOP_SECRET', Path(d.LOG_FILE).read_text())
+
+    def test_unknown_diagnostic_still_closes_gate(self):
+        self.start_consumer()
+        self.ready()
+        self.emit('ERR unknown TOP_SECRET')
+        self.wait_until(lambda: not d.ACK_CALLBACK_READY)
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertNotIn('TOP_SECRET', Path(d.LOG_FILE).read_text())
+
+    def test_stdin_eof_closes_gate(self):
+        self.start_consumer()
+        self.ready()
+        self.proc.stdin.close()
+        self.wait_until(lambda: not d.callback_ready())
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertFalse(d.ACK_CALLBACK_READY)
+
+    def test_diagnostic_disconnect_closes_gate(self):
+        self.start_consumer()
+        self.ready()
+        self.emit('ERR {"ok":false,"error":{"type":"network","subtype":"disconnected"}}')
+        self.wait_until(lambda: not d.ACK_CALLBACK_READY)
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertIsNotNone(self.proc.poll())
+
+    def test_process_exit_closes_gate(self):
+        self.start_consumer()
+        self.ready()
+        self.proc.terminate()
+        self.wait_until(lambda: not d.callback_ready())
+        d.stop_evt.set()
+        self.thread.join(timeout=4)
+        self.assertFalse(d.ACK_CALLBACK_READY)
+
+    def test_config_alone_cannot_enable_button_and_gate_forwarding(self):
+        with patch.object(d, 'notify'), patch.object(d, 'notify_feishu') as send:
+            rec = d.create_pending({'event': 'idle_prompt', 'session_id': 's'})[1]
+            self.assertNotIn('ack_value', send.call_args.kwargs)
+            with patch.object(d, 'callback_ready', return_value=True):
+                d.send_reminder(rec['key'], rec)
+            self.assertEqual(send.call_args.kwargs['ack_value']['generation'], rec['generation'])
+        with patch.object(d.subprocess, 'run', return_value=Mock(returncode=0, stdout=b'feishu ok=True')) as run:
+            d.notify_feishu('标题', '正文', 's', {'action': 'ack_reminder'})
+            self.assertNotIn('ACTION_REMINDER_ACK_VALUE', run.call_args.kwargs['env'])
+
+    def test_callback_environment_isolated_and_configurable(self):
+        for setting in (None, True, False):
+            with self.subTest(setting=setting):
+                if setting is None:
+                    d.config['feishu'].pop('ack_callback_no_proxy', None)
+                else:
+                    d.config['feishu']['ack_callback_no_proxy'] = setting
+                event = Mock()
+                event.is_set.return_value = False
+                event.wait.return_value = True
+                inherited = {'HTTP_PROXY': 'http://127.0.0.1:51166',
+                             'HTTPS_PROXY': 'http://127.0.0.1:51166',
+                             'LARK_CLI_NO_PROXY': 'inherited',
+                             'LARKSUITE_CLI_NO_UPDATE_NOTIFIER': '0',
+                             'LARKSUITE_CLI_NO_SKILLS_NOTIFIER': '0',
+                             'PATH': os.environ.get('PATH', '')}
+                with patch.dict(os.environ, inherited, clear=True), \
+                        patch.object(d, 'stop_evt', event), \
+                        patch.object(d.subprocess, 'Popen', side_effect=OSError) as popen:
+                    before = dict(os.environ)
+                    d.callback_listener_loop()
+                    env = popen.call_args.kwargs['env']
+                    self.assertEqual(dict(os.environ), before)
+                    self.assertIsNot(env, os.environ)
+                    if setting is False:
+                        self.assertNotIn('LARK_CLI_NO_PROXY', env)
+                    else:
+                        self.assertEqual(env['LARK_CLI_NO_PROXY'], '1')
+                    for key in ('LARKSUITE_CLI_NO_UPDATE_NOTIFIER', 'LARKSUITE_CLI_NO_SKILLS_NOTIFIER'):
+                        self.assertEqual(env[key], '1')
+                    self.assertEqual(env['HTTP_PROXY'], inherited['HTTP_PROXY'])
+                    self.assertEqual(env['HTTPS_PROXY'], inherited['HTTPS_PROXY'])
+                    self.assertEqual(env['PATH'], inherited['PATH'])
+                    self.assertEqual(popen.call_args.args[0][1:],
+                                     ['event', 'consume', 'card.action.trigger', '--as', 'bot'])
+                self.assertFalse(d.ACK_CALLBACK_READY)
+
+    def test_reconnect_backoff_and_shutdown(self):
+        event = Mock()
+        event.is_set.return_value = False
+        event.wait.side_effect = [False, False, True]
+        with patch.object(d, 'stop_evt', event), patch.object(d.subprocess, 'Popen', side_effect=OSError):
+            d.callback_listener_loop()
+        self.assertEqual([c.args[0] for c in event.wait.call_args_list], [1, 2, 4])
+        self.assertFalse(d.ACK_CALLBACK_READY)
 
 
 if __name__ == '__main__':

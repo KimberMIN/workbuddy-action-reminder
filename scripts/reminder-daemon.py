@@ -30,8 +30,12 @@ import datetime
 import hashlib
 import subprocess
 import re
+import secrets
+import tempfile
+import selectors
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 # ---------------------------------------------------------------------------
 # 路径与常量
@@ -72,6 +76,121 @@ session_tasks = {}  # 仅保存 Hook 提供的已脱敏任务摘要，不扫描�
 config = {}
 httpd = None
 stop_evt = threading.Event()
+# 仅消费者的真实 ready 标记可以打开门禁；配置不能绕过它。
+ACK_CALLBACK_READY = False
+callback_process = None
+CALLBACK_READY_MARKER = b"[event] ready event_key=card.action.trigger"
+
+
+def callback_ready():
+    proc = callback_process
+    return (ACK_CALLBACK_READY and not stop_evt.is_set()
+            and proc is not None and proc.poll() is None)
+
+
+def consume_callback_process(proc):
+    """只信任 CLI 的扁平 NDJSON；不记录事件、身份、token 或 stderr 原文。"""
+    global ACK_CALLBACK_READY
+    ACK_CALLBACK_READY = False
+    started = time.monotonic()
+    buffers = {"stderr": b"", "stdout": b""}
+    with selectors.DefaultSelector() as selector:
+        os.set_blocking(proc.stderr.fileno(), False)
+        os.set_blocking(proc.stdout.fileno(), False)
+        selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+        while not stop_evt.is_set() and proc.poll() is None:
+            if not ACK_CALLBACK_READY and time.monotonic() - started > 45:
+                log("callback listener: ready 超时")
+                return
+            for key, _ in selector.select(0.2):
+                stream = key.data
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    ACK_CALLBACK_READY = False
+                    return
+                buffers[stream] += chunk
+                if len(buffers[stream]) > 2 * 1024 * 1024:
+                    ACK_CALLBACK_READY = False
+                    log("callback listener: 输入超限，重新连接")
+                    return
+                while b"\n" in buffers[stream]:
+                    line, buffers[stream] = buffers[stream].split(b"\n", 1)
+                    if stream == "stderr":
+                        if line.strip() == CALLBACK_READY_MARKER:
+                            if not ACK_CALLBACK_READY and not stop_evt.is_set() and proc.poll() is None:
+                                ACK_CALLBACK_READY = True
+                                selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+                                log("callback listener: ready event_key=card.action.trigger")
+                        elif line.strip() == b"[source] feishu-websocket: connected":
+                            # CLI 会在 ready 后报告正常连接；此行本身不能打开门禁。
+                            continue
+                        elif line.startswith((b"Event received: type=", b"[event] logs: ",
+                                              b"[event] to stop gracefully: ")):
+                            # CLI 正常诊断可能携带事件标识或路径，只忽略、不转存。
+                            continue
+                        elif line.strip() and ACK_CALLBACK_READY:
+                            # 无法证明诊断行不影响连接完整性时，保守关闭门禁。
+                            ACK_CALLBACK_READY = False
+                            log("callback listener: 收到运行诊断，关闭门禁并重连")
+                            return
+                    elif callback_ready():
+                        try:
+                            event = json.loads(line)
+                        except (ValueError, UnicodeDecodeError):
+                            log("callback listener: 忽略无效 JSON")
+                            continue
+                        acknowledge_card(event)
+
+
+def callback_listener_loop():
+    global ACK_CALLBACK_READY, callback_process
+    fcfg = config.get("feishu", {})
+    if not (fcfg.get("enabled") and fcfg.get("ack_callback_enabled")
+            and fcfg.get("as", "bot") == "bot"):
+        return
+    cli = os.environ.get("ACTION_REMINDER_LARK_CLI") or fcfg.get("cli_path") or shutil.which("lark-cli")
+    if not isinstance(cli, str) or not os.path.isabs(cli) or not os.access(cli, os.X_OK):
+        log("callback listener: CLI 路径不可用，门禁保持关闭")
+        return
+    # 仅隔离回调消费者环境；新 bus 继承此环境，已有共享 bus 不会被改动。
+    env = dict(os.environ)
+    if fcfg.get("ack_callback_no_proxy", True):
+        env["LARK_CLI_NO_PROXY"] = "1"
+    else:
+        env.pop("LARK_CLI_NO_PROXY", None)
+    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+    delay = 1
+    while not stop_evt.is_set():
+        proc = None
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen([cli, "event", "consume", "card.action.trigger", "--as", "bot"],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=env)
+            callback_process = proc
+            consume_callback_process(proc)
+        except Exception:
+            log("callback listener: 连接失败（详情已隐藏）")
+        finally:
+            ACK_CALLBACK_READY = False
+            callback_process = None
+            if proc is not None:
+                # 只关闭本消费者，绝不停止共享 bus 或其他消费者。
+                proc.stdin.close()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    proc.wait()
+                proc.stdout.close()
+                proc.stderr.close()
+            log("callback listener: 门禁关闭，消费者已清理")
+        if time.monotonic() - started >= 60:
+            delay = 1
+        if stop_evt.wait(delay):
+            break
+        delay = min(delay * 2, 60)
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -133,11 +252,23 @@ def in_quiet_hours():
 # ---------------------------------------------------------------------------
 
 def save_state():
+    tmp = None
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(pending, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log("save_state error: %s" % e)
+        with lock:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                             dir=os.path.dirname(STATE_FILE), delete=False) as f:
+                tmp = f.name
+                json.dump(pending, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, STATE_FILE)
+        return True
+    except Exception:
+        log("save_state error: 状态写入失败（详情已隐藏）")
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def load_state():
@@ -195,6 +326,19 @@ def safe_summary(value, limit=180):
     return " ".join(value.split())[:limit]
 
 
+def task_summary(value):
+    text = safe_summary(value)
+    compact = re.sub(r"[\s，。！？,.!?；;：:]", "", text).lower()
+    if compact == "[地址已隐藏]":
+        return ""
+    if len(compact) < 4 or compact in {
+            "已点击", "点击了", "继续", "继续吧", "请继续", "继续执行", "好的", "好", "收到",
+            "已处理", "处理好了", "已完成", "完成了", "可以", "同意", "确认", "确认执行",
+            "ok", "okay", "yes", "done", "continue", "谢谢"}:
+        return ""
+    return text
+
+
 def context_fields(payload):
     tool_input = payload.get("tool_input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
@@ -204,7 +348,7 @@ def context_fields(payload):
         question = "；".join(q.get("question", "") for q in questions
                             if isinstance(q, dict) and isinstance(q.get("question"), str))
     return {
-        "task_title": safe_summary(payload.get("task_title") or session_tasks.get(payload.get("session_id"), "")),
+        "task_title": task_summary(payload.get("task_title")) or task_summary(session_tasks.get(payload.get("session_id"), "")),
         "tool_name": safe_summary(payload.get("tool_name"), 60),
         "operation": safe_summary(tool_input.get("description")),
         "question": safe_summary(question),
@@ -213,7 +357,7 @@ def context_fields(payload):
 
 
 def reminder_body(rec, wait_sec):
-    task = safe_summary(rec.get("task_title")) or "未提供任务名称"
+    task = task_summary(rec.get("task_title")) or "未获取原始任务名称"
     question = safe_summary(rec.get("question"))
     tool = safe_summary(rec.get("tool_name"), 60)
     operation = safe_summary(rec.get("operation"))
@@ -255,7 +399,7 @@ def notify(title, subtitle, body, group, sound=True):
         cmd += ["-message", body, "-group", group]
         if sound and config.get("sound"):
             cmd += ["-sound", config.get("sound")]
-        # 点击通知：聚焦 WorkBuddy（当前无官方深链接，先聚焦应用）
+        # macOS 通知仍仅聚焦应用；会话深链用于飞书卡片按钮。
         cmd += ["-activate", APP_BUNDLE]
         try:
             subprocess.run(cmd, capture_output=True, timeout=10)
@@ -277,7 +421,19 @@ def notify(title, subtitle, body, group, sound=True):
         return False
 
 
-def notify_feishu(title, body):
+def session_deeplink(session_id):
+    """仅编码 Hook 的会话 ID，不接受调用方提供任意跳转 URL。"""
+    if (not isinstance(session_id, str) or not session_id.strip()
+            or session_id in (".", "..")
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in session_id)):
+        return ""
+    try:
+        return "workbuddy://chat/" + quote(session_id, safe="-_.!~*'()")
+    except UnicodeError:
+        return ""
+
+
+def notify_feishu(title, body, session_id=None, ack_value=None):
     """经飞书（lark-cli）发送提醒，跨设备可达（手机/桌面都能收到）。"""
     fcfg = config.get("feishu", {})
     if not fcfg.get("enabled", False):
@@ -290,7 +446,11 @@ def notify_feishu(title, body):
     try:
         env = dict(os.environ, ACTION_REMINDER_PYTHON=sys.executable,
                    ACTION_REMINDER_CONFIG=CONFIG_FILE)
-        res = subprocess.run(["/bin/bash", script, title or "", body or ""],
+        env.pop("ACTION_REMINDER_ACK_VALUE", None)
+        if ack_value and callback_ready():
+            env["ACTION_REMINDER_ACK_VALUE"] = json.dumps(ack_value)
+        res = subprocess.run(["/bin/bash", script, title or "", body or "",
+                              session_deeplink(session_id)],
                              capture_output=True, timeout=15, env=env)
         if res.returncode != 0:
             log("feishu notify failed: exit=%d" % res.returncode)
@@ -314,7 +474,7 @@ def create_pending(payload):
     with lock:
         rec = pending.get(key)
         etype = WAIT_EVENTS.get(payload.get("event"), "idle")
-        if rec and rec.get("status") == "WAITING":
+        if rec and rec.get("status") in ("WAITING", "ACKED"):
             # 已存在且等待中：刷新最后出现时间，避免重复创建
             rec["last_seen"] = now_ts()
             rec.update({k: v for k, v in context_fields(payload).items() if v})
@@ -322,6 +482,11 @@ def create_pending(payload):
             return key, rec, False
         rec = {
             "key": key,
+            "reminder_token": secrets.token_urlsafe(32),
+            "generation": secrets.token_hex(16),
+            "ack_operator_id": (config.get("feishu", {}).get("target_id", "")
+                                if config.get("feishu", {}).get("target_type", "user") == "user"
+                                else config.get("feishu", {}).get("ack_operator_id", "")),
             "session_id": payload.get("session_id"),
             "cwd": payload.get("cwd"),
             "permission_mode": payload.get("permission_mode"),
@@ -346,6 +511,68 @@ def create_pending(payload):
     return key, rec, True
 
 
+def acknowledge_card(event):
+    """仅供可信 CLI 长连接调用；不是 HTTP 接口，也不执行任何批准操作。"""
+    if not callback_ready() or not isinstance(event, dict):
+        return False
+    if event.get("type") != "card.action.trigger" or event.get("action_tag") != "button":
+        return False
+    try:
+        value = json.loads(event.get("action_value", ""))
+    except (ValueError, TypeError):
+        return False
+    if (not isinstance(value, dict)
+            or set(value) != {"action", "reminder_token", "generation"}
+            or value.get("action") not in ("ack_reminder", "open_reminder")):
+        return False
+    token, generation = value.get("reminder_token"), value.get("generation")
+    if not isinstance(token, str) or not isinstance(generation, str):
+        return False
+    # compare_digest 只接受 ASCII 字符串，拒绝畸形值而非抛出异常。
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token) or not re.fullmatch(r"[0-9a-f]{32}", generation):
+        return False
+    with lock:
+        if not callback_ready():
+            return False
+        for rec in pending.values():
+            if not secrets.compare_digest(rec.get("reminder_token", ""), token):
+                continue
+            operator = rec.get("ack_operator_id")
+            fcfg = config.get("feishu", {})
+            configured_operator = (fcfg.get("target_id") if fcfg.get("target_type", "user") == "user"
+                                   else fcfg.get("ack_operator_id"))
+            if (not operator or operator != configured_operator or event.get("operator_id") != operator
+                    or rec.get("generation") != generation):
+                return False
+            if value["action"] == "open_reminder":
+                if rec.get("status") not in ("WAITING", "ESCALATED", "EXPIRED", "ACKED"):
+                    return False
+                link = session_deeplink(rec.get("session_id"))
+                if not link:
+                    return False
+                try:
+                    result = subprocess.run(["/usr/bin/open", link], shell=False,
+                                            capture_output=True, timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    log("callback OPEN: 本机打开请求失败")
+                    return False
+                log("callback OPEN: " + ("系统已接受请求，未验证 GUI 定位" if result.returncode == 0 else "本机打开请求失败"))
+                return result.returncode == 0
+            if rec.get("status") == "ACKED":
+                return True
+            if rec.get("status") not in ("WAITING", "ESCALATED", "EXPIRED"):
+                return False
+            previous = dict(rec)
+            rec.update(status="ACKED", next_reminder_at=None, acked_at=now_ts())
+            if not save_state():
+                rec.clear()
+                rec.update(previous)
+                return False
+            log("callback ACK: 本地状态已确认持久化")
+            return True
+    return False
+
+
 def resolve(payload):
     """取消待处理。优先按 interaction_id，否则按 session_id 整会话清理。"""
     with lock:
@@ -357,7 +584,7 @@ def resolve(payload):
                 target_keys.append(k)
         sid = payload.get("session_id")
         if sid and payload.get("event") == "UserPromptSubmit":
-            task = safe_summary(payload.get("task_title") or payload.get("prompt"))
+            task = task_summary(payload.get("task_title") or payload.get("prompt"))
             if task and (sid not in session_tasks or payload.get("task_title")):
                 session_tasks[sid] = task
         if sid and payload.get("event") == "SessionEnd":
@@ -378,6 +605,8 @@ def resolve(payload):
 
 
 def send_reminder(key, rec, first=False):
+    if rec.get("status") == "ACKED":
+        return
     etype = rec.get("type", "idle")
     label = {"permission": "需要权限确认", "idle": "等待你的输入", "elicitation": "需要补充信息"}.get(etype, "待处理")
     title = "WorkBuddy｜" + label
@@ -387,7 +616,13 @@ def send_reminder(key, rec, first=False):
     body = reminder_body(rec, wait_sec)
     notify(title, subtitle, body, group="wb-ar-" + key, sound=not in_quiet_hours())
     # 飞书通道：跨设备可达（离开 Mac 也能在手机/桌面收到）
-    notify_feishu(title, body)
+    kwargs = {"session_id": rec.get("session_id")}
+    if (callback_ready() and rec.get("ack_operator_id")
+            and rec.get("reminder_token") and rec.get("generation")):
+        kwargs["ack_value"] = {"action": "ack_reminder",
+                               "reminder_token": rec["reminder_token"],
+                               "generation": rec["generation"]}
+    notify_feishu(title, body, **kwargs)
     rec["reminder_count"] = count + 1
     cfg_repeats = config.get("max_repeats", MAX_REPEATS)
     if rec["reminder_count"] <= cfg_repeats:
@@ -443,8 +678,22 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/status":
             with lock:
-                waiting = [r for r in pending.values() if r.get("status") == "WAITING"]
-            self._send(200, {"ok": True, "waiting": len(waiting), "pending": waiting})
+                waiting = [{k: v for k, v in r.items()
+                            if k not in ("reminder_token", "generation", "ack_operator_id")}
+                           for r in pending.values() if r.get("status") == "WAITING"]
+            self._send(200, {"ok": True, "waiting": len(waiting), "pending": waiting,
+                             "ack_callback_ready": callback_ready()})
+        elif parsed.path == "/preview-existing":
+            # 只预览，不创建测试项、不泄露回调凭据，也不改变调度。
+            from urllib.parse import parse_qs
+            sid = parse_qs(parsed.query).get("session_id", [""])[0]
+            with lock:
+                records = [{"key": r["key"], "status": r.get("status"),
+                            "body": reminder_body(r, now_ts() - r.get("created_at", now_ts())),
+                            "link": session_deeplink(r.get("session_id"))}
+                           for r in pending.values() if sid and r.get("session_id") == sid]
+            self._send(200, {"ok": True, "records": records,
+                             "callback_ready": callback_ready(), "created": False})
         elif parsed.path == "/health":
             self._send(200, {"ok": True})
         else:
@@ -493,7 +742,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def shutdown():
+    global ACK_CALLBACK_READY
     log("shutdown requested")
+    ACK_CALLBACK_READY = False
     stop_evt.set()
     if httpd:
         try:
@@ -530,11 +781,18 @@ def main():
 
     log("Action Reminder daemon started on 127.0.0.1:%d (pid=%d)" % (port, os.getpid()))
     import signal
-    signal.signal(signal.SIGTERM, lambda *_: shutdown())
-    signal.signal(signal.SIGINT, lambda *_: shutdown())
+    # shutdown 必须由其他线程调用，避免 serve_forever 主线程自锁。
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=shutdown).start())
+    signal.signal(signal.SIGINT, lambda *_: threading.Thread(target=shutdown).start())
+    listener = threading.Thread(target=callback_listener_loop, name="card-callback")
+    listener.start()
     try:
         srv.serve_forever()
     finally:
+        stop_evt.set()
+        listener.join()
+        sched.join()
+        srv.server_close()
         save_state()
         log("Action Reminder daemon stopped")
 

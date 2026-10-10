@@ -216,7 +216,7 @@ cd ~/.workbuddy/plugins/cache/local/workbuddy-action-reminder/1.0.0/scripts
 
 ## 9. 已知限制
 
-1. **无官方深链协议**：目前 WorkBuddy 没有「打开指定会话/指定交互」的 URI Scheme，因此点击通知只能聚焦 App，不能精准跳转到对应确认框。这是产品侧能力缺失，待官方开放 deep-link 后可升级。
+1. **会话深链属于内部能力**：WorkBuddy 5.7.6 安装包的静态验证发现，Info.plist 注册了 `workbuddy` 协议，main 的 `showTaskNotification` 使用 `workbuddy://chat/${encodeURIComponent(sessionId)}`，renderer 将 chat 路径映射到 `/task/id`。这不是稳定公开 API，升级后可能变化。2026-10-10 已通过飞书回调按钮的真实点击验收，正确进入目标会话；该结果不代表所有会话 ID 或未来版本均兼容。飞书按钮尝试定位会话，不保证定位某个确认框；macOS 通知仍仅聚焦 App。
 2. **仅 macOS**：通知实现基于 `terminal-notifier` / `osascript`，Windows 需改用 `powershell toast`（已在设计阶段评估，本仓库当前仅提供 macOS 实现）。
 3. **守护进程需存活**：提醒由常驻守护进程驱动；若进程被杀且未配置 launchd 自启，需等下一次 Hook 事件触发懒启动（或手动 `start`）。
 
@@ -270,9 +270,51 @@ macOS 通知要求人坐在电脑前；**飞书通道**让提醒经「飞书私�
 
 ### 11.3 工作原理
 
-`reminder-daemon.py` 在每次 `send_reminder()` 中先弹 macOS 通知，再调用 `notify_feishu(title, body)`。后者执行同目录的 `notify-feishu.sh`，由脚本解析 `config.json` 的 `feishu` 配置并通过 `lark-cli im +messages-send` 发出。飞书发送失败只记日志、不阻断主流程（macOS 通知照常）。
+`reminder-daemon.py` 在每次 `send_reminder()` 中先弹 macOS 通知，再调用 `notify_feishu(title, body, session_id=...)`。目标取 Hook 提供的 `session_id`（父会话优先语义由 Hook 提供，不改用交互 ID 或猜测子任务 ID）。daemon 按 `encodeURIComponent` 的字符规则编码 ID，将 `workbuddy://chat/<encoded-id>` 作为 `notify-feishu.sh` 第三个可选参数传入；原来的双参数调用仍有效。
+
+脚本先严格校验链接：仅允许固定 `workbuddy://chat/` 前缀和一个规范 UTF-8 编码的路径段，不允许任意 URL、查询参数、片段、控制字符或畸形编码。非法非空链接直接失败且不调用 CLI；无有效会话 ID 则使用原有纯文本提醒，不生成假按钮。卡片采用 Card 2.0、蓝色 header、default 宽度；两个按钮在 `column_set flex_mode=none` 中横排，两列均 `width=weighted, weight=1`，按钮均 `width=fill`，标签保持“打开对应任务 / 已处理”。动态正文转义 HTML 实体，防止链接、@人及标签注入。
+
+两个按钮都通过已部署的可信 CLI 回调通道处理，不再依赖飞书客户端打开自定义 scheme。打开按钮仅携带 `action=open_reminder` 与随机 token/generation；本机按现有 record 的 session_id 构造链接，再以 argv 执行 `/usr/bin/open`（`shell=False`）。回调携带任意 URL、session_id 等多余字段一律拒绝。严格核对记录绑定操作者与当前已配置操作者；旧 token/generation、其他操作者及已 resolve 的记录无效。打开不会 ACK、approve、修改调度或影响其他事项；ACKED 后仍允许打开，直到记录被正常 resolve。
+
+手机点击也只会唤起运行守护进程的 Mac，不会在手机打开 WorkBuddy。系统接受 open 请求不等于 GUI 正确定位；日志明确区分失败和“系统已接受请求，未验证 GUI 定位”。
+
+脚本通过 `lark-cli im +messages-send --msg-type interactive --content ...` 发送卡片，文本降级继续使用 `--text`；配置、发送身份及失败处理保持不变。飞书发送失败只记日志、不阻断主流程（macOS 通知照常）。
 
 ### 11.4 验证
+
+已有 daemon 已接入回调监听。历史上的 `console_event_published: blocked` 不是当前状态结论；运行时以真实 ready 标记与存活子进程共同控制门禁。2026-10-10 排障确认 CLI 在 ready 后输出正常的 `[source] feishu-websocket: connected`，旧逻辑误判为故障并关闭 stdin，导致消费者反复退出、按钮灰显。现仅精确放行该正常状态；它本身不能打开门禁，断线、未知诊断、管道 EOF 和进程退出仍关闭门禁并重连。不得通过强制 ready 或无条件停止共享 bus 修复；确需重建失效代理 bus 时，必须遵守下述独占消费者检查流程。
+
+管理员需在发送提醒的同一飞书应用中进入 **事件与回调 → 回调配置**，使用长连接接收，添加 **卡片回传交互 `card.action.trigger`**，保存并按后台提示发布生效。该回调仅支持 bot；CLI 声明 `im:message:readonly` 用于自动读取卡片。无需公网地址或 localhost 回调 URL。应先再次 dry-run 确认不再 blocked，再授权进行实际接收验收；仅进程启动或 ready 标记不等于已完成端到端验收。
+
+daemon 内单实例长期 CLI 消费保持 stdin 管道存活，等 stderr ready 后开放按钮；收到断线诊断后关闭门禁。SDK 若发生未向消费者报告的静默断线，当前门禁无法单凭进程存活检测，应区分本机监听恢复与端到端回调验收。部署时可调用本机 `/stop`，由 launchd 自动重启；须确认新 daemon 和其消费者仍存活且 ready，而非仅看 dry-run。恢复后的新卡自动按当前门禁生成可用按钮，已经发送的灰色旧卡不会自动更新。尚未 ready 的新卡两个按钮明确禁用且不携带 callback，不能仅修改配置启用；旧卡回调在断线期间同样不会执行。本机不提供可伪造操作者身份的 HTTP 打开/确认接口。CLI 自动响应不代表打开或 ACK 业务成功。
+
+离线逻辑仅接受目标 open_id、随机 256 位 reminder token 与当前 generation 的匹配组合；群目标需显式 `ack_operator_id`，未配置则拒绝。确认只将一条记录标为 `ACKED`，停止后续提醒，绝不批准命令。状态以 0600 临时文件 fsync 后原子替换；持久化失败不确认成功。ACKED 记录保留到已有 resolve 生命周期边界，重复 Hook 与重启不会重新提醒；新交互或 resolve 后的新记录使用新 token/generation，旧卡失效。无 interaction_id 时沿用原稳定键，完全相同且无 resolve 边界的 Hook 无法判断是重复还是新事项，保守保持已处理；不凭时间猜测新事项。已在发送中的提醒无法撤回。
+
+#### 回调直连与失效代理 bus 恢复
+
+2026-10-10 进一步定位到：远端 WebSocket 于 13:34 断线，至 14:18 仍重试已经失效的本机代理 `127.0.0.1:51166`。consumer 重启会复用旧 bus，不能改变旧 bus 的代理环境。
+
+- `feishu.ack_callback_no_proxy` 默认 `true`：daemon 仅向回调 consumer 的环境副本设置官方 `LARK_CLI_NO_PROXY=1`，新 bus 继承此设置。显式配置为 JSON 布尔值 `false` 时移除子进程的该开关，恢复 CLI 原有代理选择；不修改父进程、系统代理或消息发送路径。
+- 回调 consumer 同时设置 `LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1` 和 `LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1`，避免通知混入长期 stderr；不使用 `--quiet`，保留 ready、断线和丢失诊断。
+- 首先执行 `LARK_CLI_NO_PROXY=1 LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 ~/.workbuddy/action-reminder/bin/lark-cli event consume card.action.trigger --as bot --dry-run`，确认身份及前置检查通过。预检不等于真实 WebSocket 已连接或点击业务已验收。
+- 重建前先用 `event stop --help` 确认支持 `--app-id`，再用 `event status --json` 核对目标 app 的全部消费者，并通过 PID/PPID 证明仅属于本提醒 daemon。有其他消费者、身份不明或不能按 app 停止时立即停止操作并请求确认。
+- 优雅 `POST /stop`，同时仅对 `com.tencent.workbuddy.action-reminder` 执行 `launchctl bootout`，防止 KeepAlive 自动重拉；保留原 plist，不调用会广泛匹配进程的控制脚本 stop。确认 daemon 已退出，重新运行 `event status --json`，只有目标 app 的消费者为零才执行 `event stop --app-id <你的应用ID> --json`。禁止 `--all`、`--force` 和直接杀 bus；如出现新消费者或停止被拒绝，停止并报告，不扩大操作范围。
+- 用原提醒 plist 执行 `launchctl bootstrap`，让更新后的 daemon 启动 consumer 并创建直连 bus。核对新 bus PID、新时间的 connected、新增日志中没有旧代理 refused，以及 `/status` 的 `ack_callback_ready=true`。日志只提取安全时间、连接标志和计数，不打印 URL 查询参数、事件内容、token 或凭据。
+- 验证只运行离线测试和只读状态，不调用 `/test`、消息发送或修改远端配置；真实按钮点击、Mac GUI 定位和 ACK 持久化仍需用户实点验收。
+
+#### 真实会话验收
+
+2026-10-10 已完成用户侧实点验收：飞书测试卡发送成功，用户确认“打开对应任务”正确进入指定真实会话；此前“已处理”按钮也已通过单条 ACK 持久化和停止重复提醒的验证。本次打开测试沿用已有 ACKED 记录，未恢复重复提醒。上述结论仅覆盖已测会话与本机环境，不保证所有 Hook ID、移动端组合或后续 WorkBuddy 版本均兼容。
+
+以下为后续回归验收的注意事项：
+
+不要为验收向 `/event` 注入当前会话的等待事件：下一次 PostToolUse 可能立即 resolve 掉它。也不要用合成 session_id 伪装真实链接目标。已增加只读 `GET /preview-existing?session_id=<编码后的真实 Hook sid>`：只筛选此 session 的已有记录，返回脱敏正文、状态、key 和该 record 实际链接，不创建记录、不更换 token、不发送通知、不改变调度。无记录返回空数组；不会为凑测试伪造目标。本轮未读取真实状态文件或其他会话。
+
+安全顺序：主代理授权部署后等待回调 ready；由外部终端查询上述只读预览并核对真实目标；暂停在该目标会话继续调用工具，避免 PostToolUse 清理记录。若已有记录仍有效，可由 daemon 已有 `notify_feishu` 发送路径对同一 record 直接发送（不调用 `create_pending` 或 `send_reminder`，不增加次数/重复提醒），必须从活跃 daemon 取得当前门禁及该 record 的 token/generation，不能另起模块伪造 ready。**当前没有暴露直接重发接口**；若主代理无法安全调用活跃实例，就停在只读预览，不要手工拷 token 或制造新测试项。用户自然进入真实等待状态后，由正常首次提醒完成实点验收也可。
+
+独立测试 session 与真实 GUI 目标的映射尚无证据，因此没有实现随意指定 link_sid 的测试捷径。安装包注册了 workbuddy scheme，GUI 导航使用 `workbuddy://chat/<conversationId>`；本轮限定安装包检索未找到 CLI session_id 到 GUI conversationId 的映射，不能断言两个 ID 相同。应人工核对 GUI 实际定位，不扫描其他会话或密钥。
+
+以下旧测试命令仅用于通知通道，不用于真实会话跳转验收，本次未执行。
 
 ```bash
 # 触发一条测试提醒（会同时弹 macOS 通知 + 发飞书消息）
@@ -291,11 +333,13 @@ grep "feishu notify" ~/.workbuddy/action-reminder/daemon.log
 
 ### 11.5 限制与注意
 
-- 飞书消息为**文本内容**（标题 + 正文），不含点击深链；点击通知聚焦 WorkBuddy 仍是 macOS 通知的能力。
+- 有有效会话 ID 时生成两个等宽按钮；无 ID 时发送文本。Card 2.0 需要飞书客户端 ≥ 7.20。横排 schema 已离线验证，实际渲染仍需客户端验收。
+- 本轮绕开客户端 scheme 跳转，改由可信回调在 Mac 打开；离线测试不证明端到端可用。运行中的 daemon 不会自动加载 Python 改动，须由主代理安排部署/重启。由于 shell 脚本会被运行中 daemon 动态调用，新旧代码混用期间打开回调可能被旧 Python 拒绝，不能将未重启状态当作完成部署。
+- 后续经授权实点验收应使用真实存在的会话：在电脑飞书点击按钮，核对打开的是该任务且没有自动批准操作；验证目标会话不存在、移动端及客户端拦截时的表现。`/test` 使用合成的 `test-session`，只能测试通知通道，不能证明真实任务定位成功。
 - `config.json` 含个人 `open_id`，已被仓库 `.gitignore` 忽略，**不会随仓库提交**，可放心分享仓库。
 - 标题使用 `【${TITLE}】` 明确变量边界，避免 `$TITLE】` 在部分 locale/Bash 组合下把中文标点作为变量名的一部分；这不是 `${1:-默认值}` 与 `set -u` 的已知 bug。脚本保留严格未定义变量检查。
 - CLI 非零退出码会传回守护进程；`ok:false`、未确认成功、非 JSON 和超时均按失败处理。日志只记录安全状态，不回显 CLI 原始输出、凭据或完整命令。
-- 提醒正文按多行显示任务、待确认操作或问题、等待时长和返回 WorkBuddy 的提示，不发送完整工作目录或会话 UUID。内容来自 Hook 实际提供的 `task_title`、`tool_name`、`tool_input.description`、`question/questions`；`UserPromptSubmit.prompt` 可更新内存中的任务摘要。缺失信息会明确标记未提供，不扫描会话文件，也不推测任务。
+- 提醒正文按多行显示任务、待确认操作或问题、等待时长和返回 WorkBuddy 的提示，正文不发送完整工作目录或会话 UUID；卡片回调仅携带随机 token/generation、不携带会话 ID；仍仅应发送给可信收件人。内容来自 Hook 实际提供的 `task_title`、`tool_name`、`tool_input.description`、`question/questions`；`UserPromptSubmit.prompt` 可更新内存中的任务摘要。“已点击 / 继续 / 好的”等短确认以及仅含 `[地址已隐藏]` 的截图路径占位不会成为任务名称，也不会覆盖已有有效摘要；历史记录里的此类标题展示时同样过滤。缺失原始任务会显示“未获取原始任务名称”，不扫描会话文件，也不推测任务。
 - 工具命令及完整参数不发送；自然语言摘要会做常见凭据、路径、命令和长标识脱敏。摘要不等同于完整会话内容，具体操作请回 WorkBuddy 核对。
 - 离线回归测试（不发送飞书或 macOS 消息）：`/usr/bin/python3 -m unittest discover -s scripts -p test_reminder.py -v`。
 
