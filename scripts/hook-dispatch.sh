@@ -22,7 +22,7 @@ RAW="$(cat)"
 [ -z "$RAW" ] && exit 0
 
 # 解析并规整事件类型：
-#  - Notification 事件用 notification_type 作为具体事件（permission_prompt / idle_prompt）
+#  - Notification 仅转发明确权限请求，不把空闲或任务完成当作阻塞
 #  - 其余事件（PermissionRequest / Elicitation / ElicitationResult / UserPromptSubmit / PostToolUse / SessionEnd / PermissionDenied）直接用 hook_event_name
 PAYLOAD="$(printf '%s' "$RAW" | "$PY" -c '
 import sys, json
@@ -30,9 +30,16 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
+if not isinstance(d, dict):
+    sys.exit(0)
 he = d.get("hook_event_name", "")
 nt = d.get("notification_type", "")
 ev = nt if he == "Notification" else he
+if ev == "PreToolUse" and d.get("tool_name") == "AskUserQuestion":
+    ev = "PermissionRequest"
+if ev not in {"permission_prompt", "PermissionRequest", "Elicitation", "ElicitationResult",
+              "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "PermissionDenied", "SessionEnd"}:
+    sys.exit(0)
 d["event"] = ev
 print(json.dumps(d, ensure_ascii=False))
 ' 2>/dev/null)"

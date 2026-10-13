@@ -58,7 +58,6 @@ TOTAL_TIMEOUT = 7200  # 超过 2 小时停止声音提醒，保留待处理中�
 WAIT_EVENTS = {
     "permission_prompt": "permission",   # 工具权限审批
     "PermissionRequest": "permission",
-    "idle_prompt": "idle",                # 等待用户输入超过 60 秒
     "Elicitation": "elicitation",        # MCP 工具请求输入
 }
 # 解除类事件 -> 取消该会话/交互的待处理
@@ -66,6 +65,7 @@ RESOLVE_EVENTS = {
     "ElicitationResult",
     "UserPromptSubmit",
     "PostToolUse",
+    "PostToolUseFailure",
     "PermissionDenied",
     "SessionEnd",
 }
@@ -278,6 +278,20 @@ def load_state():
             pending = json.load(f)
     except Exception:
         pending = {}
+    # 旧版本的空闲项不能在升级后恢复调度；保留 ACK 及按钮绑定数据。
+    changed = False
+    for rec in pending.values():
+        if rec.get("type") == "idle" or rec.get("event") == "idle_prompt":
+            rec["next_reminder_at"] = None
+            if rec.get("status") != "ACKED":
+                rec["status"] = "IGNORED"
+            changed = True
+        elif (rec.get("event") == "permission_prompt" and not rec.get("request_identity")
+              and not rec.get("operation_fingerprint") and rec.get("status") == "WAITING"):
+            rec.update(next_reminder_at=None, status="ESCALATED")
+            changed = True
+    if changed:
+        save_state()
 
 
 # ---------------------------------------------------------------------------
@@ -299,16 +313,29 @@ def fmt_wait(sec):
     return "%d 小时 %d 分钟" % (h, m % 60)
 
 
+def request_identity(payload):
+    # 字段来自实际 Hook；不同会话即使复用调用 ID 也不应合并。
+    for field in ("interaction_id", "tool_use_id", "call_id", "elicitation_id"):
+        if payload.get(field):
+            kind = "tool" if field in ("tool_use_id", "call_id") else field
+            return [kind, str(payload[field])]
+    return None
+
+
+def operation_fingerprint(payload):
+    if payload.get("tool_name") and isinstance(payload.get("tool_input"), dict):
+        raw = json.dumps([payload["tool_name"], payload["tool_input"]], sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return None
+
+
 def stable_key(payload):
-    """为一次待处理生成稳定主键，优先使用 interaction_id。"""
-    iid = payload.get("interaction_id")
-    if iid:
-        return "iid:" + str(iid)
-    sid = payload.get("session_id") or "unknown"
-    ntype = payload.get("notification_type") or payload.get("event") or "event"
-    msg = payload.get("message") or ""
-    digest = hashlib.md5(("%s|%s|%s" % (sid, ntype, msg)).encode("utf-8")).hexdigest()[:12]
-    return "key:" + digest
+    """不将原始参数持久化；缺调用 ID 时按规范化参数指纹去重。"""
+    identity = request_identity(payload)
+    family = WAIT_EVENTS.get(payload.get("event"), payload.get("event"))
+    discriminator = identity or [family, operation_fingerprint(payload) or payload.get("message", "")]
+    raw = json.dumps([payload.get("session_id"), discriminator], sort_keys=True, ensure_ascii=False)
+    return "key:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def safe_summary(value, limit=180):
@@ -350,7 +377,8 @@ def context_fields(payload):
     return {
         "task_title": task_summary(payload.get("task_title")) or task_summary(session_tasks.get(payload.get("session_id"), "")),
         "tool_name": safe_summary(payload.get("tool_name"), 60),
-        "operation": safe_summary(tool_input.get("description")),
+        "operation": (safe_summary(tool_input.get("description")) or
+                      {"Write": "写入文件（已有文件将被覆盖）", "Edit": "替换文件中的指定内容"}.get(payload.get("tool_name"), "")),
         "question": safe_summary(question),
         "message": safe_summary(payload.get("message")),
     }
@@ -469,12 +497,33 @@ def notify_feishu(title, body, session_id=None, ack_value=None):
 # 待处理记录管理
 # ---------------------------------------------------------------------------
 
+def normalize_event(payload):
+    event = payload.get("event") or payload.get("hook_event_name")
+    if event == "Notification":
+        event = payload.get("notification_type")
+    if event == "PreToolUse" and payload.get("tool_name") == "AskUserQuestion":
+        return "PermissionRequest"
+    return event
+
+
 def create_pending(payload):
+    payload = dict(payload, event=normalize_event(payload))
+    if payload.get("event") not in WAIT_EVENTS:
+        return None, None, False
     key = stable_key(payload)
     with lock:
         rec = pending.get(key)
-        etype = WAIT_EVENTS.get(payload.get("event"), "idle")
-        if rec and rec.get("status") in ("WAITING", "ACKED"):
+        if rec is None and payload.get("interaction_id"):
+            # 旧无 ID 主键可能碰撞不同操作，只有明确交互 ID 才能迁移。
+            legacy = "iid:" + str(payload["interaction_id"])
+            old = pending.get(legacy)
+            if old and old.get("session_id") == payload.get("session_id") and old.get("type") != "idle":
+                rec = pending.pop(legacy)
+                rec.update(key=key, request_identity=request_identity(payload),
+                           operation_fingerprint=operation_fingerprint(payload))
+                pending[key] = rec
+        etype = WAIT_EVENTS[payload["event"]]
+        if rec and rec.get("status") in ("WAITING", "ACKED", "ESCALATED", "EXPIRED"):
             # 已存在且等待中：刷新最后出现时间，避免重复创建
             rec["last_seen"] = now_ts()
             rec.update({k: v for k, v in context_fields(payload).items() if v})
@@ -488,6 +537,8 @@ def create_pending(payload):
                                 if config.get("feishu", {}).get("target_type", "user") == "user"
                                 else config.get("feishu", {}).get("ack_operator_id", "")),
             "session_id": payload.get("session_id"),
+            "request_identity": request_identity(payload),
+            "operation_fingerprint": operation_fingerprint(payload),
             "cwd": payload.get("cwd"),
             "permission_mode": payload.get("permission_mode"),
             "tool_name": payload.get("tool_name"),
@@ -574,14 +625,11 @@ def acknowledge_card(event):
 
 
 def resolve(payload):
-    """取消待处理。优先按 interaction_id，否则按 session_id 整会话清理。"""
+    """工具完成仅解除同一请求；普通工具结果不能解除并发授权。"""
     with lock:
-        iid = payload.get("interaction_id")
+        identity = request_identity(payload)
+        fingerprint = operation_fingerprint(payload)
         target_keys = []
-        if iid:
-            k = "iid:" + str(iid)
-            if k in pending:
-                target_keys.append(k)
         sid = payload.get("session_id")
         if sid and payload.get("event") == "UserPromptSubmit":
             task = task_summary(payload.get("task_title") or payload.get("prompt"))
@@ -589,10 +637,26 @@ def resolve(payload):
                 session_tasks[sid] = task
         if sid and payload.get("event") == "SessionEnd":
             session_tasks.pop(sid, None)
-        if sid and not iid:
-            for k, rec in list(pending.items()):
-                if rec.get("session_id") == sid:
+        for k, rec in list(pending.items()):
+            if sid and rec.get("session_id") != sid:
+                continue
+            if (sid and payload.get("event") in ("PostToolUse", "PostToolUseFailure")
+                    and rec.get("event") == "permission_prompt"
+                    and not rec.get("request_identity") and not rec.get("operation_fingerprint")):
+                # 工具已有进展时只结束泛通知去重窗口，绝不推断具体授权完成。
+                target_keys.append(k)
+            elif identity:
+                if (rec.get("request_identity") == identity
+                        or (sid and fingerprint and not rec.get("request_identity")
+                            and rec.get("operation_fingerprint") == fingerprint)):
                     target_keys.append(k)
+            elif sid and payload.get("event") in ("UserPromptSubmit", "SessionEnd"):
+                target_keys.append(k)
+            elif sid and fingerprint and not rec.get("request_identity"):
+                if rec.get("operation_fingerprint") == fingerprint:
+                    target_keys.append(k)
+        if not sid and len(target_keys) > 1:
+            return []
         removed = []
         for k in set(target_keys):
             rec = pending.pop(k, None)
@@ -625,7 +689,13 @@ def send_reminder(key, rec, first=False):
     notify_feishu(title, body, **kwargs)
     rec["reminder_count"] = count + 1
     cfg_repeats = config.get("max_repeats", MAX_REPEATS)
-    if rec["reminder_count"] <= cfg_repeats:
+    generic_permission = (rec.get("event") == "permission_prompt"
+                          and not rec.get("request_identity") and not rec.get("operation_fingerprint"))
+    if generic_permission:
+        # 泛通知不能证明后续仍阻塞：只提醒一次，留记录去重及供按钮使用。
+        rec["next_reminder_at"] = None
+        rec["status"] = "ESCALATED"
+    elif rec["reminder_count"] <= cfg_repeats:
         idx = min(rec["reminder_count"] - 1, len(REPEAT_DELAYS) - 1)
         rec["next_reminder_at"] = now_ts() + REPEAT_DELAYS[idx]
     else:
@@ -710,7 +780,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/event":
-            event = payload.get("event") or payload.get("hook_event_name")
+            event = normalize_event(payload)
             payload["event"] = event
             if event in WAIT_EVENTS:
                 key, rec, created = create_pending(payload)

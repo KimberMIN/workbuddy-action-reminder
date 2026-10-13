@@ -34,19 +34,160 @@ class ReminderTests(unittest.TestCase):
         d.config = {}
 
     def create(self, **kw):
-        payload = dict(event='idle_prompt', session_id='session-private', cwd='/Users/private/project')
+        payload = dict(event='permission_prompt', session_id='session-private', cwd='/Users/private/project')
         payload.update(kw)
         return d.create_pending(payload)[1]
 
     def test_chinese_title_and_generic_idle(self):
         self.create(message='CodeBuddy is waiting for your input')
         title, body = self.mocks[-1].call_args.args
-        self.assertEqual(title, 'WorkBuddy｜等待你的输入')
+        self.assertEqual(title, 'WorkBuddy｜需要权限确认')
         for text in ('任务：未获取原始任务名称', '未提供具体操作或问题', '等待时长：', '请返回 WorkBuddy 对应会话处理'):
             self.assertIn(text, body)
         for text in ('CodeBuddy', 'session-private', '/Users/private', '点击'):
             self.assertNotIn(text, body)
         self.assertEqual(len(body.splitlines()), 4)
+
+    def test_idle_completion_and_unknown_events_never_notify(self):
+        for event in ('idle_prompt', 'Stop', 'agent_completed', 'auth_success', 'PreToolUse', 'unknown'):
+            self.assertEqual(d.create_pending({'event': event, 'session_id': 's'}), (None, None, False))
+        self.assertFalse(d.pending)
+        self.mocks[-1].assert_not_called()
+
+    def test_call_identity_dedupe_and_parallel_resolve(self):
+        a = self.create(event='PermissionRequest', tool_use_id='a', tool_name='Write', tool_input={'file_path': '/private/a', 'content': 'SECRET'})
+        self.create(event='permission_prompt', call_id='a', message='不同提醒措辞')
+        b = self.create(event='PermissionRequest', tool_use_id='b', tool_name='Edit', tool_input={'file_path': '/private/b'})
+        self.assertEqual(self.mocks[-1].call_count, 2)
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'session_id': 'session-private', 'tool_use_id': 'other'}), [])
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'session_id': 'session-private'}), [])
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'session_id': 'session-private', 'tool_use_id': 'a'}), [a['key']])
+        self.assertIn(b['key'], d.pending)
+        self.assertNotIn('SECRET', Path(d.STATE_FILE).read_text())
+
+    def test_parameter_fingerprint_and_session_isolation(self):
+        payload = dict(event='PermissionRequest', tool_name='Bash', tool_input={'command': 'rm /private/a', 'description': '删除旧文件'})
+        a = self.create(**payload)
+        self.create(**dict(payload, tool_input=dict(reversed(list(payload['tool_input'].items())))))
+        b = self.create(**dict(payload, tool_input={'command': 'rm /private/b', 'description': '删除旧文件'}))
+        self.assertEqual(self.mocks[-1].call_count, 2)
+        self.assertNotEqual(a['key'], b['key'])
+        self.assertEqual(d.resolve(dict(payload, event='PostToolUse', session_id='session-private', tool_use_id='later-id')), [a['key']])
+        one = self.create(tool_use_id='same', session_id='one')
+        two = self.create(tool_use_id='same', session_id='two')
+        self.assertNotEqual(one['key'], two['key'])
+        d.resolve({'event': 'PermissionDenied', 'session_id': 'one', 'tool_use_id': 'same'})
+        self.assertIn(two['key'], d.pending)
+
+    def test_exhausted_and_expired_duplicates_stay_silent(self):
+        for status in ('ESCALATED', 'EXPIRED', 'ACKED'):
+            rec = self.create(interaction_id=status)
+            rec.update(status=status, next_reminder_at=None)
+            count = self.mocks[-1].call_count
+            self.create(interaction_id=status, message='新措辞')
+            self.assertEqual(self.mocks[-1].call_count, count)
+            self.assertEqual(rec['status'], status)
+
+    def test_old_idle_state_migrates_without_touching_ack_tokens(self):
+        d.pending = {'idle': {'event': 'idle_prompt', 'type': 'idle', 'status': 'WAITING', 'next_reminder_at': 1},
+                     'ack': {'event': 'idle_prompt', 'type': 'idle', 'status': 'ACKED', 'next_reminder_at': None, 'generation': 'keep'}}
+        d.save_state()
+        d.load_state()
+        self.assertEqual(d.pending['idle']['status'], 'IGNORED')
+        self.assertIsNone(d.pending['idle']['next_reminder_at'])
+        self.assertEqual(d.pending['ack']['status'], 'ACKED')
+        self.assertEqual(d.pending['ack']['generation'], 'keep')
+        self.mocks[-1].assert_not_called()
+
+    def test_legacy_ack_key_migrates_without_resend(self):
+        rec = self.create(interaction_id='legacy')
+        d.pending.pop(rec['key'])
+        rec.update(key='iid:legacy', status='ACKED')
+        d.pending['iid:legacy'] = rec
+        old_token = rec['reminder_token']
+        count = self.mocks[-1].call_count
+        updated = self.create(interaction_id='legacy')
+        self.assertEqual(updated['reminder_token'], old_token)
+        self.assertEqual(updated['status'], 'ACKED')
+        self.assertEqual(self.mocks[-1].call_count, count)
+        self.assertNotIn('iid:legacy', d.pending)
+
+    def test_legacy_no_id_collision_never_swallows_new_permission(self):
+        legacy_key = 'key:' + d.hashlib.md5(b's|PermissionRequest|').hexdigest()[:12]
+        d.pending[legacy_key] = {'session_id': 's', 'event': 'PermissionRequest', 'type': 'permission', 'status': 'ACKED'}
+        rec = self.create(event='PermissionRequest', session_id='s', tool_use_id='new', tool_name='Write', tool_input={'file_path': '/private/new'})
+        self.assertEqual(rec['status'], 'WAITING')
+        self.assertIn(legacy_key, d.pending)
+        self.mocks[-1].assert_called_once()
+
+    def test_generic_permission_only_once_including_restart(self):
+        rec = self.create(message='needs permission')
+        self.assertEqual(rec['reminder_count'], 1)
+        self.assertIsNone(rec['next_reminder_at'])
+        self.assertEqual(rec['status'], 'ESCALATED')
+        d.load_state()
+        self.create(message='needs permission')
+        self.mocks[-1].assert_called_once()
+        rec.update(status='WAITING', next_reminder_at=1)
+        d.pending[rec['key']] = rec
+        d.save_state()
+        d.load_state()
+        self.assertIsNone(d.pending[rec['key']]['next_reminder_at'])
+
+    def test_ask_user_question_pretool_only_and_permission_deduplicated(self):
+        rec = self.create(event='PreToolUse', tool_name='AskUserQuestion', tool_use_id='question',
+                          tool_input={'questions': [{'question': '使用浅色还是深色？'}]})
+        self.assertIn('待回答问题：使用浅色还是深色？', self.mocks[-1].call_args.args[1])
+        self.create(event='PermissionRequest', tool_name='AskUserQuestion', tool_use_id='question')
+        self.mocks[-1].assert_called_once()
+        for tool in ('Write', 'Edit', 'Bash'):
+            self.assertEqual(d.create_pending({'event': 'PreToolUse', 'tool_name': tool}), (None, None, False))
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'session_id': 'session-private', 'tool_use_id': 'question'}), [rec['key']])
+
+    def test_failure_resolves_only_same_call(self):
+        a = self.create(event='PermissionRequest', tool_use_id='a')
+        b = self.create(event='PermissionRequest', tool_use_id='b')
+        self.assertIn('PostToolUseFailure', d.RESOLVE_EVENTS)
+        self.assertEqual(d.resolve({'event': 'PostToolUseFailure', 'session_id': 'session-private', 'tool_use_id': 'a'}), [a['key']])
+        self.assertIn(b['key'], d.pending)
+        self.assertEqual(d.resolve({'event': 'PostToolUseFailure', 'session_id': 'session-private'}), [])
+
+    def test_tool_progress_ends_only_generic_notification_window(self):
+        for event in ('PostToolUse', 'PostToolUseFailure'):
+            d.pending.clear()
+            generic = self.create(message='needs permission')
+            concrete = self.create(event='PermissionRequest', tool_use_id='waiting')
+            fingerprint = self.create(event='permission_prompt', tool_name='Write', tool_input={'file_path': '/private/pending'})
+            other = self.create(session_id='other', message='needs permission')
+            removed = d.resolve({'event': event, 'session_id': 'session-private', 'tool_use_id': 'unrelated'})
+            self.assertEqual(removed, [generic['key']])
+            self.assertEqual(set(d.pending), {concrete['key'], fingerprint['key'], other['key']})
+            count = self.mocks[-1].call_count
+            new = self.create(message='needs permission')
+            self.assertNotEqual(new['generation'], generic['generation'])
+            self.assertEqual(self.mocks[-1].call_count, count + 1)
+
+    def test_elicitation_id_exact_resolution(self):
+        a = self.create(event='Elicitation', elicitation_id='a')
+        b = self.create(event='Elicitation', elicitation_id='b')
+        self.assertEqual(d.resolve({'event': 'ElicitationResult', 'session_id': 'session-private', 'elicitation_id': 'a'}), [a['key']])
+        self.assertIn(b['key'], d.pending)
+
+    def test_missing_session_ambiguous_identity_does_not_clear(self):
+        a = self.create(session_id='a', tool_use_id='shared')
+        b = self.create(session_id='b', tool_use_id='shared')
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'tool_use_id': 'shared'}), [])
+        self.assertEqual(set(d.pending), {a['key'], b['key']})
+        d.resolve({'event': 'SessionEnd', 'session_id': 'a'})
+        self.assertEqual(d.resolve({'event': 'PostToolUse', 'tool_use_id': 'shared'}), [b['key']])
+
+    def test_file_operations_have_safe_summary(self):
+        for tool, expected in [('Write', '写入文件'), ('Edit', '替换文件')]:
+            self.create(event='PermissionRequest', tool_name=tool, tool_use_id=tool, tool_input={'file_path': '/private/path', 'content': 'SECRET'})
+            body = self.mocks[-1].call_args.args[1]
+            self.assertIn(expected, body)
+            self.assertNotIn('/private', body)
+            self.assertNotIn('SECRET', body)
 
     def test_tool_operation_does_not_send_command(self):
         self.create(event='PermissionRequest', task_title='修复构建', tool_name='Bash',
@@ -115,12 +256,15 @@ class ReminderTests(unittest.TestCase):
         self.assertFalse(d.session_tasks)
 
     def test_resolve_iid_has_priority_and_clears_all_statuses(self):
+        keys = {}
         for iid, status in [('a', 'WAITING'), ('b', 'EXPIRED'), ('c', 'ESCALATED')]:
-            d.pending['iid:' + iid] = {'session_id': 's', 'status': status}
-        self.assertEqual(d.resolve({'interaction_id': 'a', 'session_id': 's'}), ['iid:a'])
-        self.assertEqual(set(d.pending), {'iid:b', 'iid:c'})
+            rec = self.create(session_id='s', interaction_id=iid)
+            rec['status'] = status
+            keys[iid] = rec['key']
+        self.assertEqual(d.resolve({'interaction_id': 'a', 'session_id': 's'}), [keys['a']])
+        self.assertEqual(set(d.pending), {keys['b'], keys['c']})
         self.assertEqual(d.resolve({'interaction_id': 'missing', 'session_id': 's'}), [])
-        self.assertEqual(set(d.resolve({'session_id': 's'})), {'iid:b', 'iid:c'})
+        self.assertEqual(set(d.resolve({'event': 'SessionEnd', 'session_id': 's'})), {keys['b'], keys['c']})
         self.assertEqual(json.loads(Path(d.STATE_FILE).read_text()), {})
 
     def test_expired_persisted(self):
@@ -171,6 +315,54 @@ class ReminderTests(unittest.TestCase):
             for sid in ('parent /任务', None):
                 self.assertTrue(d.notify_feishu('标题', '正文', session_id=sid))
                 self.assertEqual(run.call_args.args[0][-1], d.session_deeplink(sid))
+
+
+class HookDispatchTests(unittest.TestCase):
+    def test_ignored_notifications_never_contact_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / 'called'
+            curl = Path(tmp) / 'curl'
+            curl.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+            curl.chmod(0o700)
+            env = dict(os.environ, PATH=tmp + ':' + os.environ['PATH'], HOME=tmp)
+            for payload in ({'hook_event_name': 'Notification', 'notification_type': 'idle_prompt'},
+                            {'hook_event_name': 'Notification', 'notification_type': 'agent_completed'},
+                            {'hook_event_name': 'Stop'},
+                            {'hook_event_name': 'PreToolUse', 'tool_name': 'Write'},
+                            {'hook_event_name': 'PreToolUse', 'tool_name': 'Edit'},
+                            {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash'}, []):
+                result = subprocess.run(['/bin/bash', str(ROOT / 'hook-dispatch.sh')],
+                                        input=json.dumps(payload), text=True, capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+            self.assertFalse(marker.exists())
+
+    def test_permission_forwards_original_fields_and_no_approval_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'payload'
+            curl = Path(tmp) / 'curl'
+            curl.write_text('#!' + sys.executable + '\nimport sys\nfrom pathlib import Path\n'
+                            + 'Path(' + repr(str(output)) + ').write_text(sys.stdin.read())\n')
+            curl.chmod(0o700)
+            env = dict(os.environ, PATH=tmp + ':' + os.environ['PATH'], HOME=tmp)
+            for tool in ('Bash', 'Write', 'Edit', 'AskUserQuestion'):
+                payload = {'hook_event_name': 'PermissionRequest', 'session_id': 's',
+                           'tool_name': tool, 'tool_use_id': 'call', 'tool_input': {'description': '待确认操作'}}
+                result = subprocess.run(['/bin/bash', str(ROOT / 'hook-dispatch.sh')],
+                                        input=json.dumps(payload), text=True, capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(json.loads(output.read_text()), dict(payload, event='PermissionRequest'))
+            payload['hook_event_name'] = 'PreToolUse'
+            result = subprocess.run(['/bin/bash', str(ROOT / 'hook-dispatch.sh')],
+                                    input=json.dumps(payload), text=True, capture_output=True, env=env)
+            self.assertEqual(result.stdout, '')
+            self.assertEqual(json.loads(output.read_text()), dict(payload, event='PermissionRequest'))
+            payload['hook_event_name'] = 'PostToolUseFailure'
+            result = subprocess.run(['/bin/bash', str(ROOT / 'hook-dispatch.sh')],
+                                    input=json.dumps(payload), text=True, capture_output=True, env=env)
+            self.assertEqual(result.stdout, '')
+            self.assertEqual(json.loads(output.read_text()), dict(payload, event='PostToolUseFailure'))
 
 
 class AcknowledgeTests(unittest.TestCase):
@@ -262,7 +454,7 @@ class AcknowledgeTests(unittest.TestCase):
         self.assertEqual(new['status'], 'WAITING')
 
     def test_same_fallback_key_until_lifecycle_boundary(self):
-        payload = {'event': 'idle_prompt', 'session_id': 'fallback', 'message': '等待输入'}
+        payload = {'event': 'permission_prompt', 'session_id': 'fallback', 'message': '等待输入'}
         rec = d.create_pending(payload)[1]
         event = dict(self.event, action_value=json.dumps({
             'action': 'ack_reminder', 'reminder_token': rec['reminder_token'],
@@ -669,7 +861,7 @@ class ListenerTests(unittest.TestCase):
 
     def test_config_alone_cannot_enable_button_and_gate_forwarding(self):
         with patch.object(d, 'notify'), patch.object(d, 'notify_feishu') as send:
-            rec = d.create_pending({'event': 'idle_prompt', 'session_id': 's'})[1]
+            rec = d.create_pending({'event': 'permission_prompt', 'session_id': 's'})[1]
             self.assertNotIn('ack_value', send.call_args.kwargs)
             with patch.object(d, 'callback_ready', return_value=True):
                 d.send_reminder(rec['key'], rec)

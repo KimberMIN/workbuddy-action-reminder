@@ -69,7 +69,7 @@ WorkBuddy 的 Hook 必须是同步、快速的，否则会卡住智能体。因�
 | 事件 | matcher | 含义 | 触发提醒 |
 |------|---------|------|----------|
 | `Notification` | `permission_prompt` | 权限确认弹窗 | ✅ |
-| `Notification` | `idle_prompt` | 空闲/等待输入 | ✅ |
+| `Notification` | `idle_prompt` | 普通空闲也会产生，不能证明需要介入 | 不提醒 |
 | `PermissionRequest` | — | 插件级权限请求 | ✅ |
 | `Elicitation` | — | 等待用户做选项选择 | ✅ |
 | `ElicitationResult` | — | 用户已选择 → **清除** | 清除 |
@@ -78,7 +78,11 @@ WorkBuddy 的 Hook 必须是同步、快速的，否则会卡住智能体。因�
 | `SessionEnd` | — | 会话结束 → **清除该会话全部** | 清除 |
 | `PermissionDenied` | — | 权限被拒 → **清除** | 清除 |
 
-清除逻辑优先按 `interaction_id` 精确匹配；仅当未提供交互 ID 时才按 `session_id` 清除整个会话，包含 `WAITING`、`ESCALATED` 和 `EXPIRED` 状态。多个并行任务互不干扰。
+去重优先使用会话内 `interaction_id`、`tool_use_id`/`call_id`、`elicitation_id`；缺 ID 时使用规范化工具参数的 SHA-256 指纹，原始参数不持久化。同请求的重复 Hook 在 `WAITING`、`ACKED`、`ESCALATED`、`EXPIRED` 均不重新发送。`PostToolUse`/`PostToolUseFailure`/`PermissionDenied` 仅按调用 ID 精确解除；原等待项缺 ID 时允许匹配参数指纹，不再整会话清理。无 ID 的 `ElicitationResult` 不猜测关联项。只有 `UserPromptSubmit`/`SessionEnd` 会清理整会话。升级加载状态时将旧 idle 项停止调度，保留 ACK 标记及其 token/generation。
+
+`PreToolUse` 仅精确匹配 `AskUserQuestion`：这是明确要求用户作答的工具，不将普通 Write/Edit/Bash 的调用前事件当作授权。它与后续相同 `tool_use_id` 的 PermissionRequest 合并；不返回批准或改变权限。无法关联调用的泛 `permission_prompt` 仅首次提醒，保留记录用于去重和按钮，不继续重复；旧泛通知重启后也停止重复。只有携带明确 interaction_id 的旧键可迁移，旧无 ID 权限键可能碰撞不同操作，不将其绑定到新调用而吞掉新授权。
+
+**事件信息边界**：本机 CLI 实现的 PermissionRequest 和 PostToolUse 提供 `tool_use_id`，但仅含 message 的 permission_prompt 无法可靠关联某个具体调用，不能用时间窗口合并而吞掉并发授权。若同一授权分别发出有 ID 和无 ID 两路 Hook，仍可能产生两条提醒；同工具同参数的无 ID 事件与后来有 ID 的事件也不会冒险按指纹合并，可能产生两条首提醒；不同调用 ID 即使参数相同仍应视为并发独立请求。缺 ID 的相同参数请求在没有生命周期结束信号时也无法区分新旧。无 ID 泛通知同文再次出现会保持去重，直到同会话 PostToolUse/PostToolUseFailure 或 UserPromptSubmit/SessionEnd 结束窗口。其中工具进展仅清除无 ID 且无参数指纹的泛通知，不触碰其他具体请求；这不是已识别某个具体授权完成，不能称为完整的新授权周期识别。自然语言中的提问不等于可验证阻塞：普通回答、Stop、任务完成、idle 一律不提醒。具体决策依赖宿主真正发出的 PermissionRequest/Elicitation，未发出事件的弹窗不能由本插件保证覆盖。
 
 ---
 
@@ -124,6 +128,14 @@ workbuddy-action-reminder/
 - `~/.workbuddy/settings.json` → `enabledPlugins["workbuddy-action-reminder@local"] = true`
 
 **重启 WorkBuddy** 后插件即生效。首次触发等待事件时，守护进程会被自动懒启动。
+
+### 2026-10-13 事件过滤修复的部署与验收
+
+本轮仅修改插件文件并离线测试，未改用户 settings、未重启 daemon、未发送真实飞书消息。Python 修改需要经用户批准重启提醒 daemon 后才生效；Hook 注册修改需要宿主重新加载。本机只读核查确认用户 settings 无 hooks 覆盖且插件已启用，无需 settings 补丁。插件自身增加 AskUserQuestion 的精确 PreToolUse 注册并移除 idle_prompt。若以后发现用户直接注册的旧 idle 匹配，只移除该提醒脚本对应项，不整段覆盖 hooks。
+
+本机脱敏历史日志聚合：CREATE 为 permission 17、elicitation 1、idle 72；RESOLVE 为 UserPromptSubmit 45、ElicitationResult 1、SessionEnd 1、PostToolUse 11。这证明历史存在大量 idle 提醒，不证明每种文件授权均收到。安装包 `resetIdleTimer` 在普通空闲且无后台任务后 60 秒产生 idle；独立安装包核验确认：普通 HookManager 读取 settings/plugin/scoped command；SdkHooksManager 是独立 Map，只由 initialize/update_sdk_config 控制协议的 request.hooks 设置，invokeCallback 通过 stdout control_request/hook_callback 调用宿主，不执行插件 shell。requestHostPermission/requestSdkPermission 只读取后者；needsApproval 中 PreToolUse ask/tool.check ask 的提前返回会绕过普通 PermissionRequest。因此只改 hooks.json 不能补齐所有 GUI 文件审批，需要 WorkBuddy 宿主桥接。本轮未改安装包或权限机制，也未用文件工具的 PreToolUse 猜授权，仅修复误报、精确解除和实际到达插件的授权事件，不承诺无遗漏。
+
+部署前运行 `/usr/bin/python3 -m unittest discover -s scripts -p test_reminder.py -v`。批准后再通过现有受控重启流程加载 daemon 并核对回调 ready，普通空闲和任务完成应无提醒；在真实会话逐项停留于删除、文件覆盖/改写、授权、选项决策，核对即时提醒和摘要；并行两个授权时完成一个，不得解除另一个。双按钮仍只打开对应任务或停止单条提醒，不批准任何操作。离线测试不能替代这些真实宿主和飞书端到端验收。
 
 ### 方式 B：开机自启（launchd）
 
