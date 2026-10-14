@@ -93,7 +93,7 @@ if link:
     }
     if is_harness:
         card['body']['elements'][-1]['content'] = (
-            '<font color="grey">打开运行提醒服务的 Mac 上的 Harness 首页，请手动选择对应会话；已处理仅停止本条提醒，不批准操作。</font>')
+            '<font color="grey">打开运行提醒服务的 Mac 上的 Harness 桌面应用，请手动选择对应会话；已处理仅停止本条提醒，不批准操作。</font>')
     for label, action, style in [('打开 Harness' if is_harness else '打开对应任务', 'open_reminder', 'primary_filled'),
                                   ('已处理', 'ack_reminder', 'default')]:
         button = {'tag': 'button', 'type': style, 'width': 'fill',

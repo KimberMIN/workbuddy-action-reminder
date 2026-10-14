@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-action-reminder",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Agent Action Reminder：跨智能体的确认/授权提醒，支持 WorkBuddy、CodeBuddy 与 DeepSeek Harness，提供 macOS 和飞书通知；仅提醒，不自动批准。",
   "author": {
     "name": "闵金波 / 晓葆科技"

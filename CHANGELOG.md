@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 — Harness 桌面打开验收修复
+
+### 修复
+- Harness 飞书“打开”回调改为通过固定 bundle ID 唤起已安装的 DeepSeek Harness 桌面应用，不再打开未认证的 loopback 浏览器页。
+- 保持 WorkBuddy 的原有 deep link，不把 Harness 登录凭据放入卡片。
+- 用户实测首次打开链接落入认证错误页后完成修复；桌面启动按钮已有用户成功反馈，已处理 ACK 持久化仍待日志级/独立真人复验。
+
 ## 1.1.0 — Agent Action Reminder
 
 ### 新增
@@ -8,7 +15,7 @@
 - 对外名称由 WorkBuddy Action Reminder 改为 Agent Action Reminder。
 - DeepSeek Harness 原生 Host 插件 bundle：被动观察 session 事件，重建 live-session 审批与原生 ask_user_question 状态，不注册 answerer、不自动批准。
 - 完整快照接收与按宿主/bridge/会话/交互隔离；15 秒 lease，断线暂停，恢复保留 ACK；重启后先等待新快照。
-- Harness macOS 聚焦与飞书“打开 Harness”首页按钮，不伪造未经验证的会话 deep-link。
+- Harness macOS 聚焦与飞书“打开 Harness”按钮直接启动桌面应用，避免未认证浏览器页；不伪造未经验证的会话 deep-link。
 - 完整快照验证、JSON 大小限制、可选本地 bridge token 与跨站写入拒绝。
 - Harness 状态/接口/卡片测试、原生 JS 插件测试与运行配置隔离测试。
 

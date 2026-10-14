@@ -328,7 +328,7 @@ class HarnessTests(unittest.TestCase):
         with patch.object(d, 'callback_ready', return_value=True), \
                 patch.object(d.subprocess, 'run', return_value=Mock(returncode=0)) as run:
             self.assertTrue(d.acknowledge_card(self.callback(rec, 'open_reminder')))
-            run.assert_called_once_with(['/usr/bin/open', 'http://127.0.0.1:19387'],
+            run.assert_called_once_with(['/usr/bin/open', '-b', 'com.deepseek.dsh'],
                                         shell=False, capture_output=True, timeout=10)
             self.assertEqual(rec, before)
             for extra in ({'url': 'http://evil.invalid'}, {'decision': 'approve'}):

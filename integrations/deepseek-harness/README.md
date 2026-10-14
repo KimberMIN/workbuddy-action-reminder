@@ -12,9 +12,9 @@
 - 支持原生 `ask_user_question`：legacy blocking、timed pending、恢复后的 unknown outcome、PTC pending 子调用、晚到用户回复。
 - **不支持未经证实的 `ask_user` 别名、`request_secret` 或第三方插件自定义卡片**。不能把自然语言疑问句当作原生待办。
 - **仅跟踪当前 live sessions**。不扫描全部冷历史、不启动或恢复 Agent；live session 被卸载后不再作为当前可交互待办发送，重新成为 live 后再重建。
-- 已做离线事件/接口/lifecycle 合约测试；**尚未在真实用户 profile 安装或做真人点击端到端验证**。安装、用户配置、ASAR 都没有被修改。
+- 离线事件/接口/lifecycle测试均通过；已由本机原生路径安装到实际 desktop profile 并选中启用。真实 Harness 问答触发过提醒，桌面启动按钮由用户确认打开应用，已处理ACK持久化且原生问句继续等待49秒。原生 approval 按钮及并发/断线/长历史仍未真人覆盖。本项目未修改 ASAR。
 
-## 安装（由用户显式执行；本研究未执行）
+## 支持的本机安装方式
 
 1. 先启动并配置 Agent Action Reminder daemon；启用其 `harness.enabled`。默认 daemon 是 `http://127.0.0.1:18789`，Harness 是 `http://127.0.0.1:19387`，二者不是同一服务。
 2. 按需要修改本 bundle 的 `cordis.patch.yml` 中 **config 整体对象**：
@@ -89,11 +89,11 @@ Authorization: Bearer <可选独立本地bridge token>
 - 事件回调只调度任务，不等待网络，不 append session log、不修改原生会话。只读 observation 在 finally 中 `Symbol.dispose`。
 - 使用 session 对象与 `session.seq` 缓存：未变化的会话不会每 5 秒重复读取历史。发生变化时重新 fold 会话完整 owned event prefix，因此超长活跃会话仍有 O(history) 成本；超过时间预算保留旧状态并暂停，而不发送不完整数据。后续可以改增量 fold，但需要保留 fork/restore 一致性测试。
 
-## Harness 首页链接，不伪造会话 deep-link
+## Harness 桌面唤起，不伪造会话 deep-link
 
 已查源码的原生导航是 Client `ctx.uiWorkspace.openSession(sessionId)` → `replaceMain`，所选会话持久化于 `dsh.sessions.current`，不是 URL query/hash router。没有证据支持 `/?session=...`、`/sessions/:id` 或 `/session/:id`。
 
-因此卡片只打开配置的 **Harness 首页**；通知展示简短问题/原因，不跨设备展示完整会话标识。浏览器还须已有 Harness 登录 cookie；不能把启动 token 填进卡片 URL。将来若另写 Client 插件，可明确实现自定义路由再调用 `uiWorkspace.openSession`，但那不是本版原生 URL 能力。
+飞书卡片的“打开 Harness”按钮在本机直接唤起固定 bundle ID `com.deepseek.dsh` 的桌面应用，不通过浏览器 URL，因此无需依赖另一浏览器的 cookie，也绝不把启动 token 放入卡片。用户仍需在桌面应用内手动选择会话；通知展示简短问题/原因，不跨设备展示完整会话标识。未来若另写 Client 插件，可明确实现自定义路由再调用 `uiWorkspace.openSession`，但那不是本版原生 URL 能力。
 
 ## 为什么不用 SSE/通用 pending API
 

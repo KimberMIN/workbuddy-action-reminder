@@ -13,9 +13,9 @@
 | 宿主 | 接入方式 | 覆盖 | 打开行为 |
 |---|---|---|---|
 | WorkBuddy / CodeBuddy | 原有插件 Hook | 实际到达插件的权限请求、Elicitation、精确 AskUserQuestion | 飞书回调尝试 `workbuddy://chat/<session_id>`；macOS 聚焦 WorkBuddy |
-| DeepSeek Harness | 原生 Host 插件，被动监听已提交 session 事件 | `approval/asked` / `approval/decided`、原生 `ask_user_question` | 飞书回调打开本机 Harness **首页**，用户手动选会话；macOS 聚焦 Harness |
+| DeepSeek Harness | 原生 Host 插件，被动监听已提交 session 事件 | `approval/asked` / `approval/decided`、原生 `ask_user_question` | 飞书回调调用本机 Harness 桌面应用（不打开未经认证的浏览器 URL）；macOS 聚焦 Harness |
 
-**不要把源码兼容与离线测试等同于已部署。** Harness 适配以 `0.2.0-rc.2 / hostProtocolVersion 4` 的实际安装包源码为依据；没有修改 ASAR，也没有自动安装 Host 插件、修改用户 profile 或发送真实飞书测试消息。真实授权弹窗、按钮点击、浏览器登录状态仍需部署后验收。
+**不要把源码兼容与离线测试等同于已部署。** Harness 适配以 `0.2.0-rc.2 / hostProtocolVersion 4` 的实际安装包源码为依据；本项目不修改 ASAR。已在一台实际 desktop profile 激活原生bundle、部署本机daemon，并开始真人飞书验收：首轮发现浏览器认证页问题后改为直接唤起桌面App。真实ACK持久化和“不会自动回答原生请求”仍须独立真人复验。
 
 Harness 的 `ask_user` 别名、`request_secret` 和第三方卡片尚无已验证事件契约，**本版不承诺覆盖**。普通回答、空闲、任务结束与普通工具调用不触发提醒。WorkBuddy GUI 未向插件发出的审批事件也无法由本项目补齐。
 
@@ -105,7 +105,7 @@ bash scripts/action-reminderctl.sh status
 
 继续按宿主的本地插件安装机制加载仓库根目录的 `.codebuddy-plugin/plugin.json` 与 `hooks/hooks.json`，安装后重启或重载宿主。已有用户更新原安装位置，不重复注册同一 Hook。
 
-为避免已有 `enabledPlugins` 注册失效，**WorkBuddy 技术插件 ID 暂保留 `workbuddy-action-reminder`**，版本升级到 1.1.0；这是兼容标识，不是新的对外项目名称。旧 launchd label 与状态目录同理。新用户不需要复制原开发机器的绝对路径或注册表。
+为避免已有 `enabledPlugins` 注册失效，**WorkBuddy 技术插件 ID 暂保留 `workbuddy-action-reminder`**，版本升级到 1.1.1；这是兼容标识，不是新的对外项目名称。旧 launchd label 与状态目录同理。新用户不需要复制原开发机器的绝对路径或注册表。
 
 完整事件矩阵、原开发环境的限制与回调排障记录见 [WorkBuddy 历史说明](docs/workbuddy-history.md)。历史“已安装 / 已验收”仅描述当时环境，不代表你的安装状态。
 
@@ -125,7 +125,7 @@ Host 插件具有宿主进程权限，不受 Agent workspace sandbox 限制，�
 
 卡片提供两个等宽按钮：
 
-- **打开对应任务 / 打开 Harness**：在运行 daemon 的 Mac 上打开；手机点击也是唤起该 Mac，不是在手机里运行智能体。Harness 目前只打开首页，**没有实现未经验证的会话 URL**，浏览器仍须有有效登录状态。
+- **打开对应任务 / 打开 Harness**：在运行 daemon 的 Mac 上打开；手机点击也是唤起该 Mac，不是在手机里运行智能体。Harness 按钮直接唤起本机桌面应用，避免错误打开没有登录态的浏览器页；本版仍不实现未经验证的会话深链，用户需在应用中手动选择会话。
 - **已处理**：只停止该条提醒，**不等于批准授权、回答问题或终止任务**。真正处理必须回宿主进行。
 
 按钮通过可信 `lark-cli event consume card.action.trigger` 回调处理。飞书应用需启用长连接卡片回传事件、发布配置，并满足 CLI 所需权限。只有真实 ready 标记及存活消费者同时成立才启用按钮；未连接时按钮禁用，不能用配置强行绕过。旧灰卡不会自动更新。
@@ -176,7 +176,7 @@ bash scripts/action-reminderctl.sh uninstall-launchd
 
 ## 开发与验证
 
-v1.1.0 离线验证：**123 项 Python + 15 项 Node 测试全部通过**。详见 [验证记录与尚未验收项](docs/verification.md)。
+v1.1.1 离线验证：**123 项 Python + 15 项 Node 测试全部通过**。详见 [验证记录与尚未验收项](docs/verification.md)。
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test*.py' -v
@@ -191,7 +191,7 @@ git diff --check
 
 ## 版本与项目资源
 
-- [v1.1.0 变更记录](CHANGELOG.md)
+- [v1.1.1 变更记录](CHANGELOG.md)
 - [Harness 接入、安装与源码依据](integrations/deepseek-harness/README.md)
 - [WorkBuddy 历史记录](docs/workbuddy-history.md)
 - [GitHub 仓库（历史地址）](https://github.com/KimberMIN/workbuddy-action-reminder)

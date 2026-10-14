@@ -42,6 +42,7 @@ from harness_bridge import SOURCE as HARNESS_SOURCE, LEASE_SECONDS, validate_sna
 # 路径与常量
 # ---------------------------------------------------------------------------
 APP_BUNDLE = "com.tencent.workbuddy.mac"
+HARNESS_APP_BUNDLE = "com.deepseek.dsh"
 DEFAULT_PORT = 18789
 LEGACY_STATE_DIR = os.path.expanduser("~/.workbuddy/action-reminder")
 STATE_DIR = os.path.abspath(os.path.expanduser(
@@ -685,7 +686,13 @@ def acknowledge_card(event):
                 if not link:
                     return False
                 try:
-                    result = subprocess.run(["/usr/bin/open", link], shell=False,
+                    # Activate the signed-in Desktop app. A bare web URL opens an
+                    # unrelated browser cookie jar and can land on an auth error.
+                    # Do not pass a login token or invent a session URL.
+                    command = (["/usr/bin/open", "-b", HARNESS_APP_BUNDLE]
+                               if source_host(rec) == HARNESS_SOURCE
+                               else ["/usr/bin/open", link])
+                    result = subprocess.run(command, shell=False,
                                             capture_output=True, timeout=10)
                 except (OSError, subprocess.TimeoutExpired):
                     log("callback OPEN: 本机打开请求失败")
@@ -771,7 +778,7 @@ def send_reminder(key, rec, first=False, scheduled=False):
         label = {"permission": "需要权限确认", "elicitation": "需要补充信息"}.get(rec.get("type"), "待处理")
         title = host_label(rec) + "｜" + label
         body = reminder_body(rec, now_ts() - rec.get("created_at", now_ts()))
-        local_kwargs = {"app_bundle": "com.deepseek.dsh"} if source_host(rec) == HARNESS_SOURCE else {}
+        local_kwargs = {"app_bundle": HARNESS_APP_BUNDLE} if source_host(rec) == HARNESS_SOURCE else {}
         kwargs = {"session_id": rec.get("session_id")}
         if source_host(rec) == HARNESS_SOURCE:
             kwargs["harness_url"] = record_link(rec)
@@ -862,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "records": records,
                              "callback_ready": callback_ready(), "created": False})
         elif parsed.path == "/health":
-            self._send(200, {"ok": True, "service": "agent-action-reminder", "version": "1.1.0"})
+            self._send(200, {"ok": True, "service": "agent-action-reminder", "version": "1.1.1"})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
