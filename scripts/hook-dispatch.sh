@@ -5,15 +5,11 @@
 
 set -u
 
-# 关键：避免 WorkBuddy 沙箱代理拦截 127.0.0.1，否则转发请求会被代理吞掉而静默失败。
-unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
-export NO_PROXY="127.0.0.1,localhost"
-export no_proxy="127.0.0.1,localhost"
-
-PY=/usr/bin/python3
-DAEMON_PY="$(cd "$(dirname "$0")" && pwd)/reminder-daemon.py"
-STATE_DIR="$HOME/.workbuddy/action-reminder"
-PORT=18789
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 0
+DAEMON_PY="$SCRIPT_DIR/reminder-daemon.py"
+# Hook failures must stay silent and fail-open; never emit an approval decision.
+. "$SCRIPT_DIR/runtime-config.sh" 2>/dev/null || exit 0
+reminder_runtime_init >/dev/null 2>&1 || exit 0
 URL="http://127.0.0.1:${PORT}/event"
 
 # 读取 stdin（Hook 事件 JSON）
@@ -47,7 +43,7 @@ print(json.dumps(d, ensure_ascii=False))
 [ -z "$PAYLOAD" ] && exit 0
 
 post_event() {
-  printf '%s' "$PAYLOAD" | curl -s --noproxy 127.0.0.1 --max-time 3 -X POST "$URL" \
+  printf '%s' "$PAYLOAD" | curl -fsS --noproxy 127.0.0.1 --max-time 3 -X POST "$URL" \
     -H "Content-Type: application/json" --data-binary @- >/dev/null 2>&1
 }
 
@@ -57,8 +53,10 @@ fi
 
 # 守护进程未运行：懒启动一次后重试（仅一次，避免拖慢 Hook）
 if [ -x "$DAEMON_PY" ] || [ -f "$DAEMON_PY" ]; then
-  nohup "$PY" "$DAEMON_PY" >>"$STATE_DIR/daemon.log" 2>&1 &
-  sleep 1
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  # Delegate ownership to the controller: reuse an existing launchd job rather
+  # than racing its KeepAlive with a second manually spawned daemon.
+  bash "$SCRIPT_DIR/action-reminderctl.sh" start >/dev/null 2>&1 || exit 0
   post_event && exit 0
 fi
 

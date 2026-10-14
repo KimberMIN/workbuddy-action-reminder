@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# WorkBuddy Action Reminder — 飞书通知通道
+# Agent Action Reminder — 飞书通知通道
 # 中文标点前使用 ${TITLE} 明确变量边界，避免被当成变量名的一部分。
 set -u
-CONFIG="${ACTION_REMINDER_CONFIG:-$HOME/.workbuddy/action-reminder/config.json}"
-TITLE="${1:-WorkBuddy 待操作提醒}"
+STATE_DIR="${ACTION_REMINDER_STATE_DIR:-}"
+if [ -z "$STATE_DIR" ]; then
+  if [ -f "$HOME/.workbuddy/action-reminder/config.json" ]; then
+    STATE_DIR="$HOME/.workbuddy/action-reminder"
+  else
+    STATE_DIR="$HOME/.agent-action-reminder"
+  fi
+fi
+CONFIG="${ACTION_REMINDER_CONFIG:-$STATE_DIR/config.json}"
+TITLE="${1:-Agent 待操作提醒}"
 BODY="${2:-}"
 PYTHON="${ACTION_REMINDER_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
@@ -48,19 +56,22 @@ if raw_ack:
             or not re.fullmatch(r'[0-9a-f]{32}', ack['generation'])):
         fail('已处理按钮参数无效')
 if link:
-    # 固定 scheme/host/单个编码路径段；拒绝查询、片段、畸形编码和控制字符。
-    if not re.fullmatch(r"workbuddy://chat/(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-F]{2})+", link):
-        fail('任务链接无效')
-    encoded_id = link[len('workbuddy://chat/'):]
-    try:
-        session_id = unquote(encoded_id, errors='strict')
-        valid = (session_id.strip() and session_id not in ('.', '..')
-                 and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in session_id)
-                 and quote(session_id, safe="-_.!~*'()") == encoded_id)
-    except UnicodeError:
-        valid = False
-    if not valid:
-        fail('任务链接无效')
+    harness = re.fullmatch(r'http://127\.0\.0\.1:([1-9][0-9]{0,4})', link)
+    is_harness = bool(harness and int(harness.group(1)) <= 65535)
+    if not is_harness:
+        # 固定 scheme/host/单个编码路径段；拒绝查询、片段、畸形编码和控制字符。
+        if not re.fullmatch(r"workbuddy://chat/(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-F]{2})+", link):
+            fail('任务链接无效')
+        encoded_id = link[len('workbuddy://chat/'):]
+        try:
+            session_id = unquote(encoded_id, errors='strict')
+            valid = (session_id.strip() and session_id not in ('.', '..')
+                     and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in session_id)
+                     and quote(session_id, safe="-_.!~*'()") == encoded_id)
+        except UnicodeError:
+            valid = False
+        if not valid:
+            fail('任务链接无效')
 
     # 飞书 Markdown 用 HTML 实体展示特殊字符；单次逐字符处理防止实体注入。
     escaped_body = ''.join('&#%d;' % ord(c) if c in string.punctuation else c for c in body)
@@ -80,7 +91,10 @@ if link:
              'content': '<font color="grey">打开任务会唤起运行提醒服务的 Mac（手机点击也一样）；已处理仅停止本条提醒，不批准操作。</font>'}
         ]}
     }
-    for label, action, style in [('打开对应任务', 'open_reminder', 'primary_filled'),
+    if is_harness:
+        card['body']['elements'][-1]['content'] = (
+            '<font color="grey">打开运行提醒服务的 Mac 上的 Harness 首页，请手动选择对应会话；已处理仅停止本条提醒，不批准操作。</font>')
+    for label, action, style in [('打开 Harness' if is_harness else '打开对应任务', 'open_reminder', 'primary_filled'),
                                   ('已处理', 'ack_reminder', 'default')]:
         button = {'tag': 'button', 'type': style, 'width': 'fill',
                   'text': {'tag': 'plain_text', 'content': label}, 'behaviors': []}
@@ -93,7 +107,7 @@ if link:
             'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [button]})
     if not ack:
         card['body']['elements'][-1]['content'] = (
-            '<font color="grey">提醒服务尚未连接，按钮暂不可用，请回 Mac 的 WorkBuddy 处理。</font>')
+            '<font color="grey">提醒服务尚未连接，按钮暂不可用，请回 Mac 的对应智能体应用处理。</font>')
     content_args = ['--msg-type', 'interactive', '--content', json.dumps(card, ensure_ascii=False)]
 else:
     content_args = ['--text', '【%s】\n%s' % (title, body)]

@@ -1,0 +1,12 @@
+{
+  "name": "@local/agent-action-reminder-harness",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Passive DeepSeek Harness approval and question reminders",
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "state.js", "cordis.patch.yml", "README.md"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "engines": { "node": ">=22" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

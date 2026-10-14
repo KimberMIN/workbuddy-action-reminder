@@ -1,0 +1,9 @@
+- insert:
+    - id: agent-action-reminder-harness
+      name: '@local/agent-action-reminder-harness'
+      config:
+        bridge_id: default
+        host_url: http://127.0.0.1:19387
+        daemon_url: http://127.0.0.1:18789
+        # Optional token must match the daemon's harness.token.
+        # Do not reuse a Harness launch token or credentials here.

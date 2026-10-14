@@ -1,139 +1,104 @@
 #!/usr/bin/env bash
-# WorkBuddy Action Reminder — 控制脚本
-# 用法:
-#   action-reminderctl.sh start | stop | restart | status | test | log
-#   action-reminderctl.sh install-launchd | uninstall-launchd
-
+# Agent Action Reminder — local control; never kill processes by name.
 set -u
-
-# 关键：避免 WorkBuddy 沙箱代理（HTTP_PROXY=127.0.0.1:55134）拦截 127.0.0.1，
-# 否则 curl 健康检查会收到代理的假响应，误判"守护进程已在运行"而从不真正启动。
-unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
-export NO_PROXY="127.0.0.1,localhost"
-export no_proxy="127.0.0.1,localhost"
-
-PY=/usr/bin/python3
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DAEMON_PY="$SCRIPT_DIR/reminder-daemon.py"
-STATE_DIR="$HOME/.workbuddy/action-reminder"
-PORT=18789
-HEALTH="http://127.0.0.1:${PORT}/health"
-PLIST="$HOME/Library/LaunchAgents/com.tencent.workbuddy.action-reminder.plist"
-LABEL="com.tencent.workbuddy.action-reminder"
+. "$SCRIPT_DIR/runtime-config.sh" || exit 1
+reminder_runtime_init || { echo '提醒运行配置无效或 Python 不可用' >&2; exit 1; }
 
-is_running() {
-  curl -s --noproxy 127.0.0.1 --max-time 2 "$HEALTH" >/dev/null 2>&1
-}
+is_running() { reminder_is_running; }
 
 start() {
   if is_running; then
     echo "守护进程已在运行 (127.0.0.1:$PORT)"
     return 0
   fi
-  echo "启动守护进程..."
-  mkdir -p "$STATE_DIR"
-  nohup "$PY" "$DAEMON_PY" >>"$STATE_DIR/daemon.log" 2>&1 &
+  reminder_select_launchd || return 1
+  mkdir -p "$STATE_DIR" || return 1
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl kickstart "$DOMAIN/$LABEL" || return 1
+  elif [ -f "$PLIST" ]; then
+    launchctl bootstrap "$DOMAIN" "$PLIST" || return 1
+  else
+    nohup "$PY" "$DAEMON_PY" >>"$STATE_DIR/daemon.log" 2>&1 &
+  fi
   sleep 1
   if is_running; then
     echo "已启动。日志: $STATE_DIR/daemon.log"
   else
-    echo "启动失败，请查看日志: $STATE_DIR/daemon.log"
+    echo "启动失败或端口非本服务，请查看日志: $STATE_DIR/daemon.log" >&2
     return 1
   fi
 }
 
 stop() {
+  reminder_select_launchd || return 1
+  # Boot out only the selected exact launchd label, so KeepAlive cannot respawn.
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LABEL" || return 1
+    sleep 1
+  fi
   if ! is_running; then
-    echo "守护进程未运行"
+    echo '未检测到本提醒守护进程；不会向其他服务发送停止请求'
     return 0
   fi
-  echo "停止守护进程..."
-  curl -s --noproxy 127.0.0.1 --max-time 3 -X POST "http://127.0.0.1:${PORT}/stop" >/dev/null 2>&1
+  curl -fsS --noproxy 127.0.0.1 --max-time 3 -X POST \
+    "http://127.0.0.1:${PORT}/stop" >/dev/null 2>&1 || return 1
   sleep 1
-  pkill -f "$DAEMON_PY" 2>/dev/null
-  echo "已停止"
+  if is_running; then
+    echo '守护进程尚未停止；不使用 pkill 或按名称杀进程' >&2
+    return 1
+  fi
+  echo '已停止'
 }
 
 status() {
   if is_running; then
-    echo "== 运行中 =="
-    curl -s --noproxy 127.0.0.1 --max-time 3 "http://127.0.0.1:${PORT}/status"
+    echo '== 运行中 =='
+    curl -fsS --noproxy 127.0.0.1 --max-time 3 "http://127.0.0.1:${PORT}/status" || return 1
     echo
   else
-    echo "守护进程未运行"
+    echo '未检测到本提醒守护进程'
+    return 1
   fi
 }
 
 test_notify() {
-  if ! is_running; then
-    start || return 1
-  fi
-  echo "发送测试提醒..."
-  curl -s --noproxy 127.0.0.1 --max-time 3 -X POST "http://127.0.0.1:${PORT}/test" 2>/dev/null
+  is_running || start || return 1
+  echo '发送测试提醒...'
+  curl -fsS --noproxy 127.0.0.1 --max-time 3 -X POST "http://127.0.0.1:${PORT}/test" || return 1
   echo
-  echo "如果未看到系统通知，请检查 macOS 系统设置 → 通知 中 WorkBuddy/终端的通知权限。"
-}
-
-log() {
-  tail -n 50 "$STATE_DIR/daemon.log" 2>/dev/null
 }
 
 install_launchd() {
-  mkdir -p "$HOME/Library/LaunchAgents"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>$LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PY</string>
-    <string>$DAEMON_PY</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$STATE_DIR/daemon.log</string>
-  <key>StandardErrorPath</key>
-  <string>$STATE_DIR/daemon.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
-</dict>
-</plist>
-EOF
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
-    || launchctl load "$PLIST" 2>/dev/null
+  reminder_select_launchd || return 1
+  mkdir -p "$HOME/Library/LaunchAgents" "$STATE_DIR" || return 1
+  # Stop a verified manual instance before handing ownership to launchd.
+  stop || return 1
+  reminder_write_plist || return 1
+  launchctl bootstrap "$DOMAIN" "$PLIST" || return 1
   echo "已写入并加载自启: $PLIST"
-  echo "立即启动..."
-  launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || start
 }
 
 uninstall_launchd() {
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  launchctl unload "$PLIST" 2>/dev/null
-  rm -f "$PLIST"
+  reminder_select_launchd || return 1
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LABEL" || return 1
+  fi
+  # PLIST is constructed only from HOME and one of two fixed labels above.
+  rm -f -- "$PLIST" || return 1
   echo "已卸载自启 ($PLIST)"
 }
 
 case "${1:-}" in
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 1; start ;;
+  restart) stop && sleep 1 && start ;;
   status) status ;;
+  health) is_running ;;
   test) test_notify ;;
-  log) log ;;
+  log) tail -n 50 "$STATE_DIR/daemon.log" ;;
   install-launchd) install_launchd ;;
   uninstall-launchd) uninstall_launchd ;;
-  *)
-    echo "用法: $0 {start|stop|restart|status|test|log|install-launchd|uninstall-launchd}"
-    exit 1
-    ;;
+  *) echo "用法: $0 {start|stop|restart|status|health|test|log|install-launchd|uninstall-launchd}"; exit 1 ;;
 esac

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy Action Reminder — 本地提醒守护进程
+Agent Action Reminder — 本地提醒守护进程
 =============================================
 
 职责：
@@ -36,13 +36,18 @@ import selectors
 import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlparse
+from harness_bridge import SOURCE as HARNESS_SOURCE, LEASE_SECONDS, validate_snapshot, valid_host_url
 
 # ---------------------------------------------------------------------------
 # 路径与常量
 # ---------------------------------------------------------------------------
 APP_BUNDLE = "com.tencent.workbuddy.mac"
 DEFAULT_PORT = 18789
-STATE_DIR = os.path.expanduser("~/.workbuddy/action-reminder")
+LEGACY_STATE_DIR = os.path.expanduser("~/.workbuddy/action-reminder")
+STATE_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("ACTION_REMINDER_STATE_DIR") or
+    (LEGACY_STATE_DIR if os.path.isfile(os.path.join(LEGACY_STATE_DIR, "config.json"))
+     else "~/.agent-action-reminder")))
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 LOG_FILE = os.path.join(STATE_DIR, "daemon.log")
@@ -74,6 +79,7 @@ lock = threading.RLock()
 pending = {}        # key -> record(dict)
 session_tasks = {}  # 仅保存 Hook 提供的已脱敏任务摘要，不扫描会话文件
 config = {}
+harness_bridges = {}  # monotonic leases, intentionally NOT persisted
 httpd = None
 stop_evt = threading.Event()
 # 仅消费者的真实 ready 标记可以打开门禁；配置不能绕过它。
@@ -220,6 +226,7 @@ def load_config():
         "enabled": True,
         "max_repeats": MAX_REPEATS,
         "total_timeout": TOTAL_TIMEOUT,
+        "harness": {"enabled": False},
         "feishu": {
             "enabled": True,        # 是否经飞书发送提醒（跨设备可达）
             "target_type": "user",  # user=私聊(open_id) / chat=群(chat_id)
@@ -230,9 +237,17 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             user = json.load(f)
+        if not isinstance(user, dict):
+            raise ValueError("config must be an object")
         defaults.update(user)
-    except Exception:
+    except FileNotFoundError:
         pass
+    if type(defaults.get("port")) is not int or not 1 <= defaults["port"] <= 65535:
+        raise ValueError("port must be an integer between 1 and 65535")
+    hcfg = defaults.get("harness", {})
+    if (not isinstance(hcfg, dict) or not isinstance(hcfg.get("token", ""), str)
+            or type(hcfg.get("enabled", False)) is not bool):
+        raise ValueError("invalid harness configuration")
     config = defaults
 
 
@@ -329,12 +344,25 @@ def operation_fingerprint(payload):
     return None
 
 
+def source_host(payload):
+    """Old records/hooks remain WorkBuddy; other hosts cannot resolve them."""
+    return payload.get("source", "workbuddy")
+
+
+def host_label(rec):
+    return {"workbuddy": "WorkBuddy", "deepseek-harness": "DeepSeek Harness"}.get(
+        source_host(rec), "Agent")
+
+
 def stable_key(payload):
     """不将原始参数持久化；缺调用 ID 时按规范化参数指纹去重。"""
     identity = request_identity(payload)
     family = WAIT_EVENTS.get(payload.get("event"), payload.get("event"))
     discriminator = identity or [family, operation_fingerprint(payload) or payload.get("message", "")]
-    raw = json.dumps([payload.get("session_id"), discriminator], sort_keys=True, ensure_ascii=False)
+    parts = [payload.get("session_id"), discriminator]
+    if source_host(payload) != "workbuddy":
+        parts[:0] = [source_host(payload), payload.get("bridge_id", "default")]
+    raw = json.dumps(parts, sort_keys=True, ensure_ascii=False)
     return "key:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -375,7 +403,9 @@ def context_fields(payload):
         question = "；".join(q.get("question", "") for q in questions
                             if isinstance(q, dict) and isinstance(q.get("question"), str))
     return {
-        "task_title": task_summary(payload.get("task_title")) or task_summary(session_tasks.get(payload.get("session_id"), "")),
+        "task_title": task_summary(payload.get("task_title")) or (
+            task_summary(session_tasks.get(payload.get("session_id"), ""))
+            if source_host(payload) == "workbuddy" else ""),
         "tool_name": safe_summary(payload.get("tool_name"), 60),
         "operation": (safe_summary(tool_input.get("description")) or
                       {"Write": "写入文件（已有文件将被覆盖）", "Edit": "替换文件中的指定内容"}.get(payload.get("tool_name"), "")),
@@ -401,14 +431,14 @@ def reminder_body(rec, wait_sec):
         detail = "待处理内容：等待你的输入；未提供具体操作或问题"
     return "\n".join(["任务：" + task, detail,
                       "等待时长：%s · 第 %d 次提醒" % (fmt_wait(wait_sec), rec.get("reminder_count", 0) + 1),
-                      "请返回 WorkBuddy 对应会话处理。"])
+                      "请返回 %s 对应会话处理。" % host_label(rec)])
 
 
 # ---------------------------------------------------------------------------
 # macOS 通知
 # ---------------------------------------------------------------------------
 
-def notify(title, subtitle, body, group, sound=True):
+def notify(title, subtitle, body, group, sound=True, app_bundle=APP_BUNDLE):
     """优先 terminal-notifier（点击聚焦 WorkBuddy），否则 osascript 兜底。"""
     tn = None
     for p in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"):
@@ -428,7 +458,7 @@ def notify(title, subtitle, body, group, sound=True):
         if sound and config.get("sound"):
             cmd += ["-sound", config.get("sound")]
         # macOS 通知仍仅聚焦应用；会话深链用于飞书卡片按钮。
-        cmd += ["-activate", APP_BUNDLE]
+        cmd += ["-activate", app_bundle]
         try:
             subprocess.run(cmd, capture_output=True, timeout=10)
             return True
@@ -461,7 +491,7 @@ def session_deeplink(session_id):
         return ""
 
 
-def notify_feishu(title, body, session_id=None, ack_value=None):
+def notify_feishu(title, body, session_id=None, ack_value=None, harness_url=None):
     """经飞书（lark-cli）发送提醒，跨设备可达（手机/桌面都能收到）。"""
     fcfg = config.get("feishu", {})
     if not fcfg.get("enabled", False):
@@ -478,7 +508,8 @@ def notify_feishu(title, body, session_id=None, ack_value=None):
         if ack_value and callback_ready():
             env["ACTION_REMINDER_ACK_VALUE"] = json.dumps(ack_value)
         res = subprocess.run(["/bin/bash", script, title or "", body or "",
-                              session_deeplink(session_id)],
+                              (harness_url if valid_host_url(harness_url) else "")
+                              if harness_url is not None else session_deeplink(session_id)],
                              capture_output=True, timeout=15, env=env)
         if res.returncode != 0:
             log("feishu notify failed: exit=%d" % res.returncode)
@@ -503,17 +534,17 @@ def normalize_event(payload):
         event = payload.get("notification_type")
     if event == "PreToolUse" and payload.get("tool_name") == "AskUserQuestion":
         return "PermissionRequest"
-    return event
+    return event if isinstance(event, str) else None
 
 
-def create_pending(payload):
+def create_pending(payload, defer_notification=False):
     payload = dict(payload, event=normalize_event(payload))
     if payload.get("event") not in WAIT_EVENTS:
         return None, None, False
     key = stable_key(payload)
     with lock:
         rec = pending.get(key)
-        if rec is None and payload.get("interaction_id"):
+        if rec is None and source_host(payload) == "workbuddy" and payload.get("interaction_id"):
             # 旧无 ID 主键可能碰撞不同操作，只有明确交互 ID 才能迁移。
             legacy = "iid:" + str(payload["interaction_id"])
             old = pending.get(legacy)
@@ -536,6 +567,9 @@ def create_pending(payload):
             "ack_operator_id": (config.get("feishu", {}).get("target_id", "")
                                 if config.get("feishu", {}).get("target_type", "user") == "user"
                                 else config.get("feishu", {}).get("ack_operator_id", "")),
+            "source": source_host(payload),
+            "bridge_id": payload.get("bridge_id"),
+            "host_url": payload.get("host_url"),
             "session_id": payload.get("session_id"),
             "request_identity": request_identity(payload),
             "operation_fingerprint": operation_fingerprint(payload),
@@ -555,11 +589,60 @@ def create_pending(payload):
         rec.update(context_fields(payload))
         pending[key] = rec
         save_state()
-        # 首次提醒（含飞书通道）必须在此处与调度状态原子更新：
-        # 避免调度线程在 next_reminder_at 仍为「立即」时抢占并重复发送。
+    # send_reminder atomically claims first delivery; never hold this outer lock
+    # during notification I/O, including legacy WorkBuddy requests.
+    if not defer_notification:
         send_reminder(key, rec, first=True)
     log("CREATE pending %s type=%s session=%s" % (key, etype, rec.get("session_id")))
     return key, rec, True
+
+
+def harness_record_live(rec):
+    bridge = harness_bridges.get(rec.get("bridge_id"), {})
+    return (config.get("harness", {}).get("enabled") is True
+            and time.monotonic() - bridge.get("last_seen", float("-inf")) < LEASE_SECONDS)
+
+
+def reconcile_harness(payload):
+    """Authoritative pending snapshot; disappearance resolves, silence only pauses."""
+    bridge_id, host_url, events = validate_snapshot(payload)
+    if config.get("harness", {}).get("enabled") is not True:
+        raise ValueError("Harness integration is disabled")
+    with lock:
+        clock = time.monotonic()
+        boot_id, sequence = payload["boot_id"], payload["sequence"]
+        previous = harness_bridges.get(bridge_id)
+        retired = set(previous.get("retired", ())) if previous else set()
+        if previous:
+            if previous["host_url"] != host_url or boot_id in retired:
+                raise ValueError("bridge identity conflict")
+            if previous["boot_id"] == boot_id:
+                if sequence <= previous["sequence"]:
+                    raise ValueError("stale snapshot")
+            else:
+                if clock - previous["last_seen"] < LEASE_SECONDS:
+                    raise ValueError("previous bridge lease is still active")
+                retired.add(previous["boot_id"])
+        active = {stable_key(event) for event in events}
+        harness_bridges[bridge_id] = {"last_seen": clock, "host_url": host_url,
+                                     "boot_id": boot_id, "sequence": sequence, "retired": retired}
+        for key, rec in list(pending.items()):
+            if (source_host(rec) == HARNESS_SOURCE and rec.get("bridge_id") == bridge_id
+                    and key not in active):
+                pending.pop(key)
+        for event in events:
+            key, rec, _ = create_pending(event, defer_notification=True)
+            rec["host_url"] = host_url
+        save_state()
+    return len(active)
+
+
+def record_link(rec):
+    if source_host(rec) == HARNESS_SOURCE:
+        # This Harness version has no verified session URL route. Open home only.
+        value = rec.get("host_url")
+        return value if valid_host_url(value) else ""
+    return session_deeplink(rec.get("session_id"))
 
 
 def acknowledge_card(event):
@@ -598,7 +681,7 @@ def acknowledge_card(event):
             if value["action"] == "open_reminder":
                 if rec.get("status") not in ("WAITING", "ESCALATED", "EXPIRED", "ACKED"):
                     return False
-                link = session_deeplink(rec.get("session_id"))
+                link = record_link(rec)
                 if not link:
                     return False
                 try:
@@ -638,6 +721,10 @@ def resolve(payload):
         if sid and payload.get("event") == "SessionEnd":
             session_tasks.pop(sid, None)
         for k, rec in list(pending.items()):
+            if source_host(rec) != source_host(payload):
+                continue
+            if source_host(rec) == HARNESS_SOURCE and rec.get("bridge_id") != payload.get("bridge_id"):
+                continue
             if sid and rec.get("session_id") != sid:
                 continue
             if (sid and payload.get("event") in ("PostToolUse", "PostToolUseFailure")
@@ -668,41 +755,47 @@ def resolve(payload):
         return removed
 
 
-def send_reminder(key, rec, first=False):
-    if rec.get("status") == "ACKED":
-        return
-    etype = rec.get("type", "idle")
-    label = {"permission": "需要权限确认", "idle": "等待你的输入", "elicitation": "需要补充信息"}.get(etype, "待处理")
-    title = "WorkBuddy｜" + label
-    subtitle = label
-    wait_sec = now_ts() - rec.get("created_at", now_ts())
-    count = rec.get("reminder_count", 0)
-    body = reminder_body(rec, wait_sec)
-    notify(title, subtitle, body, group="wb-ar-" + key, sound=not in_quiet_hours())
-    # 飞书通道：跨设备可达（离开 Mac 也能在手机/桌面收到）
-    kwargs = {"session_id": rec.get("session_id")}
-    if (callback_ready() and rec.get("ack_operator_id")
-            and rec.get("reminder_token") and rec.get("generation")):
-        kwargs["ack_value"] = {"action": "ack_reminder",
-                               "reminder_token": rec["reminder_token"],
-                               "generation": rec["generation"]}
+def send_reminder(key, rec, first=False, scheduled=False):
+    # Claim/schedule under lock, but do not hold it during Harness notification I/O:
+    # heartbeat reconciliation must remain available even if lark-cli is slow.
+    with lock:
+        if pending.get(key) is not rec or rec.get("status") == "ACKED":
+            return
+        if first and rec.get("reminder_count", 0) > 0:
+            return  # The scheduler already claimed this first delivery.
+        if scheduled and (rec.get("status") != "WAITING" or not rec.get("next_reminder_at")
+                          or rec["next_reminder_at"] > now_ts()):
+            return  # A Hook or another claimant rescheduled it after the due scan.
+        if source_host(rec) == HARNESS_SOURCE and not harness_record_live(rec):
+            return
+        label = {"permission": "需要权限确认", "elicitation": "需要补充信息"}.get(rec.get("type"), "待处理")
+        title = host_label(rec) + "｜" + label
+        body = reminder_body(rec, now_ts() - rec.get("created_at", now_ts()))
+        local_kwargs = {"app_bundle": "com.deepseek.dsh"} if source_host(rec) == HARNESS_SOURCE else {}
+        kwargs = {"session_id": rec.get("session_id")}
+        if source_host(rec) == HARNESS_SOURCE:
+            kwargs["harness_url"] = record_link(rec)
+        if (callback_ready() and rec.get("ack_operator_id")
+                and rec.get("reminder_token") and rec.get("generation")):
+            kwargs["ack_value"] = {"action": "ack_reminder",
+                                   "reminder_token": rec["reminder_token"],
+                                   "generation": rec["generation"]}
+        rec["reminder_count"] = rec.get("reminder_count", 0) + 1
+        generic_permission = (rec.get("event") == "permission_prompt"
+                              and not rec.get("request_identity") and not rec.get("operation_fingerprint"))
+        if generic_permission or rec["reminder_count"] > config.get("max_repeats", MAX_REPEATS):
+            rec.update(next_reminder_at=None, status="ESCALATED")
+        else:
+            idx = min(rec["reminder_count"] - 1, len(REPEAT_DELAYS) - 1)
+            rec["next_reminder_at"] = now_ts() + REPEAT_DELAYS[idx]
+        save_state()
+    notify(title, label, body, group="ar-" + key, sound=not in_quiet_hours(), **local_kwargs)
+    with lock:
+        if pending.get(key) is not rec or rec.get("status") == "ACKED":
+            return
+        if source_host(rec) == HARNESS_SOURCE and not harness_record_live(rec):
+            return
     notify_feishu(title, body, **kwargs)
-    rec["reminder_count"] = count + 1
-    cfg_repeats = config.get("max_repeats", MAX_REPEATS)
-    generic_permission = (rec.get("event") == "permission_prompt"
-                          and not rec.get("request_identity") and not rec.get("operation_fingerprint"))
-    if generic_permission:
-        # 泛通知不能证明后续仍阻塞：只提醒一次，留记录去重及供按钮使用。
-        rec["next_reminder_at"] = None
-        rec["status"] = "ESCALATED"
-    elif rec["reminder_count"] <= cfg_repeats:
-        idx = min(rec["reminder_count"] - 1, len(REPEAT_DELAYS) - 1)
-        rec["next_reminder_at"] = now_ts() + REPEAT_DELAYS[idx]
-    else:
-        rec["next_reminder_at"] = None
-        rec["status"] = "ESCALATED"
-        log("ESCALATED pending %s after %d reminders" % (key, rec["reminder_count"]))
-    save_state()
 
 
 # ---------------------------------------------------------------------------
@@ -716,10 +809,13 @@ def scheduler_loop():
             break
         with lock:
             due = [k for k, r in pending.items()
-                   if r.get("status") == "WAITING" and r.get("next_reminder_at") and now_ts() >= r["next_reminder_at"]]
-            for k in due:
+                   if r.get("status") == "WAITING" and r.get("next_reminder_at")
+                   and (source_host(r) != HARNESS_SOURCE or harness_record_live(r))
+                   and now_ts() >= r["next_reminder_at"]]
+        for k in due:
+            with lock:
                 rec = pending.get(k)
-                if not rec:
+                if not rec or rec.get("status") != "WAITING":
                     continue
                 if now_ts() - rec.get("created_at", now_ts()) > config.get("total_timeout", TOTAL_TIMEOUT):
                     rec["next_reminder_at"] = None
@@ -727,7 +823,7 @@ def scheduler_loop():
                     log("EXPIRED pending %s (total timeout)" % k)
                     save_state()
                     continue
-                send_reminder(k, rec)
+            send_reminder(k, rec, scheduled=True)
         time.sleep(0.05)
 
 
@@ -748,8 +844,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/status":
             with lock:
-                waiting = [{k: v for k, v in r.items()
-                            if k not in ("reminder_token", "generation", "ack_operator_id")}
+                waiting = [dict({k: v for k, v in r.items()
+                                 if k not in ("reminder_token", "generation", "ack_operator_id")},
+                                paused=(source_host(r) == HARNESS_SOURCE and not harness_record_live(r)))
                            for r in pending.values() if r.get("status") == "WAITING"]
             self._send(200, {"ok": True, "waiting": len(waiting), "pending": waiting,
                              "ack_callback_ready": callback_ready()})
@@ -760,26 +857,58 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 records = [{"key": r["key"], "status": r.get("status"),
                             "body": reminder_body(r, now_ts() - r.get("created_at", now_ts())),
-                            "link": session_deeplink(r.get("session_id"))}
+                            "link": record_link(r)}
                            for r in pending.values() if sid and r.get("session_id") == sid]
             self._send(200, {"ok": True, "records": records,
                              "callback_ready": callback_ready(), "created": False})
         elif parsed.path == "/health":
-            self._send(200, {"ok": True})
+            self._send(200, {"ok": True, "service": "agent-action-reminder", "version": "1.1.0"})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        # A local service is not an invitation for cross-origin browser writes.
+        if self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self._send(403, {"ok": False, "error": "browser writes are not allowed"})
+            return
+        if parsed.path == "/harness/snapshot":
+            hcfg = config.get("harness", {})
+            if hcfg.get("enabled") is not True:
+                self._send(403, {"ok": False, "error": "Harness integration is disabled"})
+                return
+            token = hcfg.get("token", "")
+            supplied = self.headers.get("Authorization", "")
+            if token and not secrets.compare_digest(supplied.encode(), ("Bearer " + token).encode()):
+                self._send(403, {"ok": False, "error": "invalid bridge authorization"})
+                return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                self._send(415, {"ok": False, "error": "application/json required"})
+                return
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if not 0 <= length <= 1024 * 1024:
+                raise ValueError("invalid body size")
             raw = self.rfile.read(length) if length else b"{}"
             payload = json.loads(raw.decode("utf-8") or "{}")
-        except Exception as e:
-            self._send(400, {"ok": False, "error": "bad json: %s" % e})
+            if not isinstance(payload, dict):
+                raise ValueError("expected object")
+        except (ValueError, UnicodeError):
+            self._send(400, {"ok": False, "error": "invalid JSON object or body size"})
             return
 
-        if parsed.path == "/event":
+        if parsed.path == "/harness/snapshot":
+            try:
+                count = reconcile_harness(payload)
+            except ValueError:
+                self._send(400, {"ok": False, "error": "invalid Harness snapshot"})
+                return
+            self._send(200, {"ok": True, "pending": count})
+        elif parsed.path == "/event":
+            # Harness may enter only through its validated authoritative snapshots.
+            if source_host(payload) != "workbuddy":
+                self._send(400, {"ok": False, "error": "use the host snapshot endpoint"})
+                return
             event = normalize_event(payload)
             payload["event"] = event
             if event in WAIT_EVENTS:
@@ -828,9 +957,10 @@ def shutdown():
 # ---------------------------------------------------------------------------
 
 def main():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     load_config()
     load_state()
-    port = int(config.get("port", DEFAULT_PORT))
+    port = config.get("port", DEFAULT_PORT)
     if not config.get("enabled", True):
         log("daemon disabled by config, exit")
         sys.exit(0)

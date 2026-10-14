@@ -5,7 +5,7 @@
 
 set -u
 
-TITLE="${1:-WorkBuddy 提醒}"
+TITLE="${1:-Agent Action Reminder}"
 SUB="${2:-}"
 BODY="${3:-}"
 GROUP="${4:-wb-ar-manual}"
