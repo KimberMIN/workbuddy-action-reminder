@@ -1,3 +1,5 @@
+<p><img src="assets/icon-256.png" width="96" height="96" alt="Agent Action Reminder icon"></p>
+
 # DeepSeek Harness 原生被动提醒插件
 
 这是 **Host 插件 bundle**，不是浏览器抓屏脚本，也不修改 Harness 安装包。插件只旁观已有确认请求，将当前等待项发给 Agent Action Reminder；所有批准、拒绝、答案与密钥输入仍在 Harness 完成。
@@ -33,8 +35,16 @@
    ```
 
    这只是原生 `plugin_manager` 的参数示例，不是 shell 命令。安装具有 profile 全局影响、需要该工具要求的授权；若当前 session 禁止提权，请由用户在 UI 操作，不绕过限制。插件本身没有依赖或 install/build scripts，不能额外批准无关 build scripts。
-4. 查看 Plugin Manager 实际 activation 状态；`failed` / `overridden` / `restart-required` 都不能当作已生效。替换已安装 JS 版本通常需要重启；不承诺修改目录自动 HMR。
-5. 在独立测试会话发起真正需要用户确认的操作，检查提醒只在原生 pending 时出现；手工批准/拒绝后检查停止。不要为测试降低 sandbox、自动批准危险操作或创建真实密钥。
+4. 本版本的 UI 入口为侧栏「插件 → 添加插件」，填写本地绝对路径；UI 安装完成后还须点击「立即启用」，不能把仅下载完成当作已启用。若使用 CLI，须先保存任务并**完全退出 Desktop**，再在外部终端执行：
+
+   ```bash
+   "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" \
+     plugin --profile desktop add "/absolute/path/to/private/deepseek-harness" --ignore-scripts
+   ```
+
+   使用用户私有配置的 bundle 路径，不要误用缺少本地 token 的示例目录。官方 launcher 已随应用提供，不要求全局安装 dsh；新增且有效的 bundle 会自动进入 profile 的启用列表，已有但被禁用的包不会因此自动重新启用。执行后重新打开 Desktop。不要在仍运行的 Desktop 旁边直接运行 CLI 写 profile。
+5. 查看 Plugin Manager 实际 activation 状态；`failed` / `overridden` / `restart-required` 都不能当作已生效。替换已安装 JS 版本通常需要重启；不承诺修改目录自动 HMR。
+6. 在独立测试会话发起真正需要用户确认的操作，检查提醒只在原生 pending 时出现；手工批准/拒绝后检查停止。不要为测试降低 sandbox、自动批准危险操作或创建真实密钥。
 
 此插件不懒启动 daemon，也不创建常驻子进程。daemon 未运行、bridge 未开启、token 不匹配或状态读取失败时，只输出不含 payload 的摘要警告并重试。
 

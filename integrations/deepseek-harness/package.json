@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Passive DeepSeek Harness approval and question reminders",
-  "exports": { ".": "./index.js" },
-  "files": ["index.js", "state.js", "cordis.patch.yml", "README.md"],
+  "icon": "./assets/icon.svg",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "files": ["index.js", "state.js", "cordis.patch.yml", "README.md", "assets"],
   "scripts": { "test": "node --test test/*.test.js" },
   "engines": { "node": ">=22" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }

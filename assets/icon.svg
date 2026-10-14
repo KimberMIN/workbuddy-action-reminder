@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Action Reminder</title>
+  <desc id="desc">Notification bell with an amber pending-action indicator.</desc>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="#082B63"/>
+  <rect x="60" y="60" width="904" height="904" rx="196" fill="none" stroke="#235BB4" stroke-width="8"/>
+  <rect x="466" y="216" width="92" height="130" rx="46" fill="#FFFFFF"/>
+  <path d="M512 278 C402 278 314 366 314 474 L314 536 C314 592 294 626 253 656 C223 679 239 716 273 716 L751 716 C785 716 801 679 771 656 C730 626 710 592 710 536 L710 474 C710 366 622 278 512 278 Z" fill="#FFFFFF"/>
+  <path d="M438 744 L586 744 C584 786 555 818 512 818 C469 818 440 786 438 744 Z" fill="#FFFFFF"/>
+  <circle cx="704" cy="334" r="118" fill="#082B63"/>
+  <circle cx="704" cy="334" r="88" fill="#FFB72B"/>
+</svg>

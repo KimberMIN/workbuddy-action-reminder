@@ -1,3 +1,5 @@
+<p><img src="assets/icon-128.png" width="96" height="96" alt="Agent Action Reminder icon"></p>
+
 # Agent Action Reminder
 
 **智能体待办提醒 · macOS + 飞书 · 只提醒，不自动批准**
@@ -164,9 +166,17 @@ bash scripts/action-reminderctl.sh uninstall-launchd
 
 仅监听 `127.0.0.1`，不是公网服务。写入接口拒绝浏览器 Origin / cross-site 请求；快照仅接受 JSON，限制大小并在完整验证后更新。不要反向代理到公网。断线、静默暂停和普通已完成状态必须区分。
 
+## 图标资源
+
+- `assets/icon.svg`：可缩放矢量源；`assets/icon-{16,32,64,128,256,512,1024}.png`：透明背景栅格图标；`assets/favicon.ico`：多尺寸图标。
+- 原生 Harness bundle 内自带 `assets/icon.svg` 与 256px PNG，使用已核实的 `package.json.icon` 字段并导出 `./package.json`，不依赖仓库外路径。
+- WorkBuddy 的图标 manifest 字段尚未核实，因此不添加猜测字段；资源随完整项目包分发，README 可直接显示。
+- 这些是项目/插件包图标，不修改 WorkBuddy、Harness 应用本身的图标或 macOS 通知归属。
+- 维护者可用安装了 Pillow 的 Python 执行 `python3 scripts/build-icons.py` 重建资源；用户安装插件不需要 Pillow。
+
 ## 开发与验证
 
-v1.1.0 离线验证：**118 项 Python + 15 项 Node 测试全部通过**。详见 [验证记录与尚未验收项](docs/verification.md)。
+v1.1.0 离线验证：**123 项 Python + 15 项 Node 测试全部通过**。详见 [验证记录与尚未验收项](docs/verification.md)。
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test*.py' -v

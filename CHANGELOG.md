@@ -3,6 +3,8 @@
 ## 1.1.0 — Agent Action Reminder
 
 ### 新增
+- 原创项目图标：SVG、16–1024px PNG 与 ICO，README 和原生 Harness bundle 同步内置。
+- Harness manifest 使用官方根 `icon` 字段、导出 `./package.json` 并包含 assets，保证安装后图标可解析。
 - 对外名称由 WorkBuddy Action Reminder 改为 Agent Action Reminder。
 - DeepSeek Harness 原生 Host 插件 bundle：被动观察 session 事件，重建 live-session 审批与原生 ask_user_question 状态，不注册 answerer、不自动批准。
 - 完整快照接收与按宿主/bridge/会话/交互隔离；15 秒 lease，断线暂停，恢复保留 ACK；重启后先等待新快照。

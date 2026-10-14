@@ -2,11 +2,12 @@
 
 ## 离线验证
 
-- Python：`python3 -m unittest discover -s scripts -p 'test*.py' -q`，**118/118 通过**。
+- Python：`python3 -m unittest discover -s scripts -p 'test*.py' -q`，**123/123 通过**。
   - 原 WorkBuddy 回归：70 项。
   - 运行配置与控制脚本：17 项。
   - Harness 快照、租约、顺序保护、接口与卡片：26 项。
   - 确定性并发回归：5 项。
+  - 图标尺寸、PNG/ICO完整性、自包含SVG及原生manifest：5 项。
 - Node：`node --test integrations/deepseek-harness/test/*.test.js`，**15/15 通过**。
 - 所有 Shell 脚本逐个 `bash -n` 通过，`git diff --check` 通过。
 - 全部通知/CLI/原生打开动作使用 mock。HTTP 测试仅绑定临时 loopback 端口，不使用真实 daemon。
@@ -24,11 +25,13 @@
 
 ## 尚未完成的真实环境验收
 
-本次没有修改用户 settings/profile、安装 Host 插件、修改 ASAR、控制真实 launchd/daemon 或发送真实飞书消息，因此不宣称以下项目已通过：
+首轮离线验证没有操作实际服务。随后经用户授权和暂停任务确认，已在一台实际 macOS 环境原位升级 daemon，保留原 WorkBuddy 入口和 launchd 注册；实际 health 返回 1.1.0、回调 ready=true，运行文件与测试提交一致。早先更换启动路径的尝试失败并完整回滚后，原位方案成功。
+
+这些只证明后台部署与监听就绪，不证明 Host 插件激活或真人按钮通过。未修改 ASAR，以下仍待实际验收：
 
 - Plugin Manager 的真实 activation 与替换版本后的重启加载。
 - 原生确认弹窗与问题回答全链路。
-- 飞书回调 ready、用户实际点击、Mac 聚焦和浏览器登录。
+- 飞书真人按钮回调、用户实际点击、Mac 聚焦和浏览器登录。
 - 多个真实并发待办、断线重连与长历史性能。
 
 `ask_user` 别名、`request_secret` 与第三方自定义卡片不在本版已验证支持范围。Harness 卡片只打开首页，不实现未经证实的会话深链。
